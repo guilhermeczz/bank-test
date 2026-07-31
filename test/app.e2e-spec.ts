@@ -444,4 +444,247 @@ describe('AppController (e2e)', () => {
         .expect(400);
     });
   });
+
+  describe('POST /webhooks/psp', () => {
+    async function createChargeForWebhook(
+      paymentMethod: 'BOLETO' | 'PIX',
+    ): Promise<{ id: string; reference: string }> {
+      const payload = createChargePayload(paymentMethod);
+      payload.amount = 45_050;
+      const response = await request(app.getHttpServer())
+        .post('/charges')
+        .send(payload)
+        .expect(201);
+      const body: unknown = response.body;
+      const id = readChargeId(body);
+      assertRecord(body);
+      const paymentInstrument = body.paymentInstrument;
+      assertRecord(paymentInstrument);
+      const reference =
+        paymentMethod === 'BOLETO'
+          ? paymentInstrument.nossoNumero
+          : paymentInstrument.txid;
+
+      if (typeof reference !== 'string') {
+        throw new Error('Expected a payment reference in the response.');
+      }
+
+      return { id, reference };
+    }
+
+    it('processes a boleto payment and persists the paid status', async () => {
+      const charge = await createChargeForWebhook('BOLETO');
+
+      const webhookResponse = await request(app.getHttpServer())
+        .post('/webhooks/psp')
+        .send({
+          event: 'boleto.paid',
+          nossoNumero: charge.reference,
+          paidAmount: 45_050,
+          paidAt: '2026-08-14T14:32:00-03:00',
+        })
+        .expect(200);
+      const webhookBody: unknown = webhookResponse.body;
+      assertRecord(webhookBody);
+      expect(webhookBody).toMatchObject({
+        chargeId: charge.id,
+        status: 'PAID',
+        event: 'boleto.paid',
+      });
+
+      const queryResponse = await request(app.getHttpServer())
+        .get(`/charges/${charge.id}`)
+        .expect(200);
+      const queryBody: unknown = queryResponse.body;
+      assertRecord(queryBody);
+      expect(queryBody.status).toBe('PAID');
+    });
+
+    it('processes a Pix payment and persists the paid status', async () => {
+      const charge = await createChargeForWebhook('PIX');
+
+      const webhookResponse = await request(app.getHttpServer())
+        .post('/webhooks/psp')
+        .send({
+          event: 'pix.paid',
+          txid: charge.reference,
+          paidAmount: 45_050,
+          paidAt: '2026-08-14T09:10:00-03:00',
+          endToEndId: 'E12345678901234567890',
+        })
+        .expect(200);
+      const webhookBody: unknown = webhookResponse.body;
+      assertRecord(webhookBody);
+      expect(webhookBody).toMatchObject({
+        chargeId: charge.id,
+        status: 'PAID',
+        event: 'pix.paid',
+      });
+
+      const queryResponse = await request(app.getHttpServer())
+        .get(`/charges/${charge.id}`)
+        .expect(200);
+      const queryBody: unknown = queryResponse.body;
+      assertRecord(queryBody);
+      expect(queryBody.status).toBe('PAID');
+    });
+
+    it('returns 404 for an unknown nossoNumero', async () => {
+      await request(app.getHttpServer())
+        .post('/webhooks/psp')
+        .send({
+          event: 'boleto.paid',
+          nossoNumero: 'unknown-reference',
+          paidAmount: 45_050,
+          paidAt: '2026-08-14T14:32:00-03:00',
+        })
+        .expect(404);
+    });
+
+    it('returns 404 for an unknown txid', async () => {
+      await request(app.getHttpServer())
+        .post('/webhooks/psp')
+        .send({
+          event: 'pix.paid',
+          txid: 'unknown-reference',
+          paidAmount: 45_050,
+          paidAt: '2026-08-14T09:10:00-03:00',
+          endToEndId: 'E12345678901234567890',
+        })
+        .expect(404);
+    });
+
+    it('returns 422 when paidAmount differs', async () => {
+      const charge = await createChargeForWebhook('BOLETO');
+
+      await request(app.getHttpServer())
+        .post('/webhooks/psp')
+        .send({
+          event: 'boleto.paid',
+          nossoNumero: charge.reference,
+          paidAmount: 45_049,
+          paidAt: '2026-08-14T14:32:00-03:00',
+        })
+        .expect(422);
+    });
+
+    it('keeps the charge pending after an amount mismatch', async () => {
+      const charge = await createChargeForWebhook('BOLETO');
+      await request(app.getHttpServer())
+        .post('/webhooks/psp')
+        .send({
+          event: 'boleto.paid',
+          nossoNumero: charge.reference,
+          paidAmount: 45_049,
+          paidAt: '2026-08-14T14:32:00-03:00',
+        })
+        .expect(422);
+
+      const response = await request(app.getHttpServer())
+        .get(`/charges/${charge.id}`)
+        .expect(200);
+      const body: unknown = response.body;
+      assertRecord(body);
+      expect(body.status).toBe('PENDING');
+    });
+
+    it('returns 409 when paying a cancelled charge', async () => {
+      const charge = await createChargeForWebhook('BOLETO');
+      await request(app.getHttpServer())
+        .post(`/charges/${charge.id}/cancel`)
+        .expect(200);
+
+      await request(app.getHttpServer())
+        .post('/webhooks/psp')
+        .send({
+          event: 'boleto.paid',
+          nossoNumero: charge.reference,
+          paidAmount: 45_050,
+          paidAt: '2026-08-14T14:32:00-03:00',
+        })
+        .expect(409);
+    });
+
+    it('returns 400 for an invalid event', async () => {
+      await request(app.getHttpServer())
+        .post('/webhooks/psp')
+        .send({
+          event: 'charge.paid',
+          paidAmount: 45_050,
+          paidAt: '2026-08-14T14:32:00-03:00',
+        })
+        .expect(400);
+    });
+
+    it('returns 400 for boleto without nossoNumero', async () => {
+      await request(app.getHttpServer())
+        .post('/webhooks/psp')
+        .send({
+          event: 'boleto.paid',
+          paidAmount: 45_050,
+          paidAt: '2026-08-14T14:32:00-03:00',
+        })
+        .expect(400);
+    });
+
+    it('returns 400 for Pix without txid', async () => {
+      await request(app.getHttpServer())
+        .post('/webhooks/psp')
+        .send({
+          event: 'pix.paid',
+          paidAmount: 45_050,
+          paidAt: '2026-08-14T09:10:00-03:00',
+          endToEndId: 'E12345678901234567890',
+        })
+        .expect(400);
+    });
+
+    it('returns 400 for Pix without endToEndId', async () => {
+      await request(app.getHttpServer())
+        .post('/webhooks/psp')
+        .send({
+          event: 'pix.paid',
+          txid: 'pix-reference',
+          paidAmount: 45_050,
+          paidAt: '2026-08-14T09:10:00-03:00',
+        })
+        .expect(400);
+    });
+
+    it('returns 400 for a decimal paidAmount', async () => {
+      await request(app.getHttpServer())
+        .post('/webhooks/psp')
+        .send({
+          event: 'boleto.paid',
+          nossoNumero: 'boleto-reference',
+          paidAmount: 45_050.5,
+          paidAt: '2026-08-14T14:32:00-03:00',
+        })
+        .expect(400);
+    });
+
+    it('returns 400 when paidAmount is zero', async () => {
+      await request(app.getHttpServer())
+        .post('/webhooks/psp')
+        .send({
+          event: 'boleto.paid',
+          nossoNumero: 'boleto-reference',
+          paidAmount: 0,
+          paidAt: '2026-08-14T14:32:00-03:00',
+        })
+        .expect(400);
+    });
+
+    it('returns 400 for an invalid paidAt', async () => {
+      await request(app.getHttpServer())
+        .post('/webhooks/psp')
+        .send({
+          event: 'boleto.paid',
+          nossoNumero: 'boleto-reference',
+          paidAmount: 45_050,
+          paidAt: 'not-a-date',
+        })
+        .expect(400);
+    });
+  });
 });
