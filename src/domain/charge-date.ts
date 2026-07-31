@@ -1,18 +1,13 @@
 import { ChargeValidationError } from './domain-error';
 
-/** Fuso de negócio usado para interpretar o dia civil das cobranças. */
 export const CHARGE_TIME_ZONE = 'America/Sao_Paulo';
 
-/**
- * Retorna a data civil correspondente a um instante no fuso de negócio. Usar
- * `Intl.DateTimeFormat` evita que o resultado dependa do fuso configurado no
- * servidor em que a aplicação estiver sendo executada.
- */
 function getReferenceCivilDate(referenceDate: Date): string {
   if (Number.isNaN(referenceDate.getTime())) {
     throw new ChargeValidationError('Reference date is invalid.');
   }
 
+  // O fuso explícito evita depender da configuração do servidor.
   const parts = new Intl.DateTimeFormat('en-US', {
     timeZone: CHARGE_TIME_ZONE,
     year: 'numeric',
@@ -31,11 +26,6 @@ function getReferenceCivilDate(referenceDate: Date): string {
   return `${year}-${month}-${day}`;
 }
 
-/**
- * Confirma que os componentes recebidos formam uma data existente no calendário.
- * A criação em UTC é usada somente para verificar ano, mês e dia, sem converter
- * o vencimento civil em um instante sujeito ao fuso do servidor.
- */
 function isExistingCivilDate(
   year: number,
   month: number,
@@ -50,14 +40,6 @@ function isExistingCivilDate(
   );
 }
 
-/**
- * Valida o vencimento da cobrança. `dueDate` representa uma data civil, isto é,
- * um dia do calendário no formato `YYYY-MM-DD`, e não um instante com horário.
- * Por isso, a comparação usa o dia atual em `America/Sao_Paulo` explicitamente.
- *
- * Nesta etapa, a regra permite o dia atual ou um dia futuro. A regra completa de
- * encerramento às 23:59:59 será aplicada posteriormente durante os pagamentos.
- */
 export function validateDueDate(dueDate: string, referenceDate: Date): void {
   const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(dueDate);
 
@@ -75,8 +57,6 @@ export function validateDueDate(dueDate: string, referenceDate: Date): void {
 
   const currentCivilDate = getReferenceCivilDate(referenceDate);
 
-  // Datas ISO neste formato possuem ordem lexicográfica igual à cronológica,
-  // permitindo comparar dias sem introduzir horários ou conversões de fuso.
   if (dueDate < currentCivilDate) {
     throw new ChargeValidationError('Due date cannot be in the past.');
   }

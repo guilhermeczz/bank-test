@@ -11,6 +11,7 @@ import {
 
 export type PspWebhookEvent = 'boleto.paid' | 'pix.paid' | 'pix.expired';
 
+// O contrato assumido para `pix.expired` usa `txid` e `expiredAt` em ISO 8601.
 export class PspWebhookDto {
   @IsIn(['boleto.paid', 'pix.paid', 'pix.expired'])
   event!: PspWebhookEvent;
@@ -51,8 +52,6 @@ export class PspWebhookDto {
   @IsNotEmpty()
   endToEndId?: string;
 
-  // O payload assumido para `pix.expired` informa o instante de expiração
-  // observado pelo PSP; essa premissa será documentada posteriormente.
   @ValidateIf((input: PspWebhookDto) => input.event === 'pix.expired')
   @IsDefined()
   @IsISO8601()

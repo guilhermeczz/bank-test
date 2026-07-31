@@ -1,11 +1,6 @@
 export type PaymentDivergenceReason = 'AMOUNT_MISMATCH';
 
-/**
- * Registra separadamente uma tentativa de pagamento com valor divergente. A
- * cobrança mantém suas regras de estado, enquanto este registro imutável guarda
- * os dados recebidos para consulta interna futura. Valores permanecem em
- * centavos para preservar a mesma precisão utilizada pelo domínio.
- */
+// Registro imutável separado da cobrança; os valores permanecem em centavos.
 export interface PaymentDivergence {
   readonly id: string;
   readonly chargeId: string;

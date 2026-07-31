@@ -29,12 +29,10 @@ export class PspWebhooksController {
       return this.pspWebhooksService.process(input);
     } catch (error: unknown) {
       if (error instanceof PaymentReferenceNotFoundError) {
-        // A referência externa não corresponde a uma cobrança conhecida.
         throw new NotFoundException(error.message);
       }
 
       if (error instanceof PaymentAmountMismatchError) {
-        // O payload é válido, mas seu valor não pode ser processado.
         throw new UnprocessableEntityException(error.message);
       }
 
@@ -43,7 +41,6 @@ export class PspWebhooksController {
       }
 
       if (error instanceof ChargeStateError) {
-        // A cobrança existe, porém seu estado entra em conflito com o pagamento.
         throw new ConflictException(error.message);
       }
 

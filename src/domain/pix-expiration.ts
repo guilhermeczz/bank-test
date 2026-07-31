@@ -43,8 +43,7 @@ function getSaoPauloCivilDate(referenceAt: Date): CivilDateParts {
     throw new Error('Reference date is invalid.');
   }
 
-  // A data civil é obtida explicitamente em São Paulo para que o resultado não
-  // dependa do fuso horário configurado no servidor.
+  // A comparação usa a data civil de São Paulo, não o fuso local da máquina.
   const parts = new Intl.DateTimeFormat('en-US', {
     timeZone: CHARGE_TIME_ZONE,
     year: 'numeric',
@@ -86,7 +85,7 @@ export function evaluatePixExpiration(
   return {
     daysAfterDueDate,
     lastPayableDate,
-    // O terceiro dia ainda é integralmente pagável; a expiração começa no quarto.
+    // O terceiro dia ainda é pagável; a expiração começa somente no quarto.
     isExpired: daysAfterDueDate > PIX_TOLERANCE_IN_DAYS,
   };
 }

@@ -42,8 +42,6 @@ function parseDueDate(dueDate: string): CivilDateParts {
 }
 
 function parsePaidAt(paidAt: string): Date {
-  // Exigir data e hora, além de validar o instante, evita aceitar somente uma
-  // data civil onde o contrato espera um timestamp ISO 8601.
   const match =
     /^(\d{4})-(\d{2})-(\d{2})T(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d(?:\.\d+)?(?:Z|[+-](?:[01]\d|2[0-3]):[0-5]\d)$/.exec(
       paidAt,
@@ -76,8 +74,7 @@ function parsePaidAt(paidAt: string): Date {
 }
 
 function getSaoPauloCivilDate(date: Date): CivilDateParts {
-  // O instante é convertido explicitamente para a data civil de São Paulo, sem
-  // depender do fuso horário configurado na máquina que executa a aplicação.
+  // O instante é convertido para a data civil de São Paulo antes de contar o atraso.
   const parts = new Intl.DateTimeFormat('en-US', {
     timeZone: CHARGE_TIME_ZONE,
     year: 'numeric',
@@ -127,9 +124,8 @@ export function calculateBoletoPaymentAmount(
     };
   }
 
-  // Cada componente é arredondado separadamente para produzir centavos inteiros.
+  // Multa e juros são arredondados separadamente; 333/1.000.000 equivale a 0,0333% ao dia.
   const fineAmount = Math.round((amountInCents * 2) / 100);
-  // 333 / 1.000.000 representa a taxa diária de 0,0333%.
   const interestAmount = Math.round(
     (amountInCents * daysLate * DAILY_INTEREST_NUMERATOR) /
       DAILY_INTEREST_DENOMINATOR,

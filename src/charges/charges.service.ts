@@ -18,7 +18,6 @@ import {
 } from './in-memory-charge.repository';
 import { InMemoryIdempotentChargeRequestRepository } from './in-memory-idempotent-charge-request.repository';
 
-/** Representa uma falha técnica ao conversar com o provedor de pagamentos. */
 export class PaymentProviderError extends Error {
   constructor(message: string) {
     super(message);
@@ -26,7 +25,6 @@ export class PaymentProviderError extends Error {
   }
 }
 
-/** Representa a tentativa de acessar uma cobrança que não está no repositório. */
 export class ChargeNotFoundError extends Error {
   constructor(id: string) {
     super(`Charge ${id} was not found.`);
@@ -48,11 +46,6 @@ export class IdempotencyConflictError extends Error {
   }
 }
 
-/**
- * Coordena a criação da cobrança: valida os dados, solicita o instrumento ao PSP,
- * cria a entidade e persiste o resultado. As regras continuam implementadas no
- * domínio; o service apenas organiza a ordem dessas operações.
- */
 @Injectable()
 export class ChargesService {
   constructor(
@@ -95,8 +88,7 @@ export class ChargesService {
           throw new IdempotencyConflictError(normalizedKey);
         }
 
-        // A repetição retorna a entidade já persistida antes de chegar ao PSP,
-        // evitando outro instrumento, UUID ou registro de cobrança.
+        // Uma repetição válida reutiliza a cobrança sem chamar novamente o PSP.
         const existingCharge = this.repository.findById(existing.chargeId);
 
         if (existingCharge === null) {
@@ -112,8 +104,6 @@ export class ChargesService {
     try {
       paymentInstrument = await this.paymentProvider.issue(input.paymentMethod);
     } catch {
-      // Uma falha do PSP é técnica e acontece antes da persistência. Ela recebe
-      // um erro próprio para que a camada HTTP possa responder adequadamente.
       throw new PaymentProviderError('Could not issue the payment instrument.');
     }
 
@@ -129,8 +119,7 @@ export class ChargesService {
     this.repository.save(charge);
 
     if (normalizedKey !== undefined && requestHash !== undefined) {
-      // A chave só é salva depois da cobrança para que falhas de validação ou do
-      // PSP não bloqueiem permanentemente uma tentativa futura válida.
+      // A chave só é salva após a cobrança, evitando apontar para uma criação que falhou.
       this.idempotencyRepository.save({
         key: normalizedKey,
         requestHash,
@@ -157,8 +146,6 @@ export class ChargesService {
   cancel(id: string): Charge {
     const charge = this.findById(id);
 
-    // O service delega a transição à entidade para não duplicar regras sobre
-    // quais estados podem ou não ser cancelados.
     charge.cancel();
     this.repository.save(charge);
 
@@ -166,8 +153,6 @@ export class ChargesService {
   }
 
   list(query: ListChargesQueryDto): PaginatedCharges {
-    // A normalização acontece no service para que o repositório compare apenas
-    // a representação numérica já validada por `PayerDocument`.
     const payerDocument =
       query.payerDocument === undefined
         ? undefined
@@ -187,6 +172,7 @@ export class ChargesService {
   }
 
   private refreshPixExpiration(charge: Charge, referenceAt: Date): void {
+    // Em memória, a atualização preguiçosa substitui um scheduler.
     if (charge.paymentMethod !== 'PIX' || charge.status !== 'PENDING') {
       return;
     }
@@ -197,8 +183,6 @@ export class ChargesService {
       return;
     }
 
-    // Nesta implementação in-memory, a atualização preguiçosa substitui um
-    // scheduler e persiste a expiração quando a cobrança volta a ser acessada.
     charge.expire();
     this.repository.save(charge);
   }
@@ -228,8 +212,7 @@ export class ChargesService {
     normalizedDocument: string,
     description: string,
   ): string {
-    // O array fixa a ordem dos campos, independentemente da ordem recebida no
-    // JSON. O documento normalizado trata versões formatadas como o mesmo valor.
+    // Ordem fixa e documento normalizado tornam o hash independente do formato do JSON.
     const canonicalRequest = JSON.stringify([
       input.payer.name,
       normalizedDocument,

@@ -11,10 +11,6 @@ import {
 
 import type { PaymentMethod } from '../../domain/payment-method';
 
-/**
- * Valida o formato dos dados do pagador recebidos pela API. As regras próprias
- * de CPF e CNPJ continuam protegidas por `PayerDocument` no domínio.
- */
 export class PayerDto {
   @IsString()
   @IsNotEmpty()
@@ -28,11 +24,7 @@ export class PayerDto {
   email!: string;
 }
 
-/**
- * Define e valida o formato da requisição HTTP. O DTO verifica tipos e campos
- * obrigatórios, enquanto o domínio continua responsável pelas regras financeiras.
- * Na API o campo se chama `amount`, mas seu valor representa centavos inteiros.
- */
+// O DTO valida o formato HTTP; regras financeiras ficam no domínio e `amount` é centavos.
 export class CreateChargeDto {
   @IsDefined()
   @ValidateNested()

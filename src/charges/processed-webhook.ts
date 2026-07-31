@@ -19,7 +19,6 @@ export type ProcessedWebhookOutcome =
       readonly expectedAmount: number;
     };
 
-/** Guarda o resultado imutável de uma notificação que já produziu efeito. */
 export interface ProcessedWebhook {
   readonly key: string;
   readonly chargeId: string;

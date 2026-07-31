@@ -83,8 +83,8 @@ export class ChargesController {
     }
   }
 
-  /** O mapeamento explícito impede que o contrato HTTP dependa da entidade. */
   private toResponse(charge: Charge) {
+    // O mapeamento explícito separa o contrato HTTP da estrutura interna da entidade.
     return {
       id: charge.id,
       status: charge.status,
@@ -115,12 +115,10 @@ export class ChargesController {
     }
 
     if (error instanceof ChargeNotFoundError) {
-      // A ausência do recurso solicitado é representada por HTTP 404.
       throw new NotFoundException(error.message);
     }
 
     if (error instanceof ChargeStateError) {
-      // A operação é válida, mas conflita com o estado atual da cobrança.
       throw new ConflictException(error.message);
     }
 

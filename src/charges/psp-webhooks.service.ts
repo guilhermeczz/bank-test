@@ -67,8 +67,7 @@ export class PspWebhooksService {
     const processed = this.processedWebhookRepository.findByKey(webhookKey);
 
     if (processed !== null) {
-      // Uma repetição reapresenta o resultado original sem localizar a cobrança
-      // ou executar novamente alterações de estado e persistências.
+      // A repetição exata reapresenta o resultado original sem repetir efeitos.
       return this.replayProcessedWebhook(processed);
     }
 
@@ -81,8 +80,7 @@ export class PspWebhooksService {
     let canReconcileExpiredPix = false;
 
     if (input.event === 'pix.paid') {
-      // `paidAt` é o momento real do pagamento, ainda que o webhook tenha sido
-      // entregue posteriormente e a cobrança já esteja marcada como expirada.
+      // `paidAt` representa o pagamento real, mesmo que o webhook chegue depois.
       const evaluation = evaluatePixExpiration(
         charge.dueDate,
         new Date(paidAt),
@@ -101,8 +99,6 @@ export class PspWebhooksService {
     }
 
     if (charge.status !== 'PENDING' && !canReconcileExpiredPix) {
-      // A entidade produz o erro de estado antes que uma diferença de valor seja
-      // interpretada incorretamente como divergência financeira.
       charge.markAsPaid();
     }
 
@@ -128,8 +124,7 @@ export class PspWebhooksService {
     }
 
     if (canReconcileExpiredPix) {
-      // O estado EXPIRED ocorreu antes da confirmação; como o pagamento ocorreu
-      // dentro do prazo, esta transição reconcilia os eventos fora de ordem.
+      // O evento atrasado pode reconciliar EXPIRED quando o pagamento ocorreu no prazo.
       charge.reconcileExpiredPixPayment(new Date(paidAt));
     } else {
       charge.markAsPaid();
@@ -169,7 +164,6 @@ export class PspWebhooksService {
       throw new PaymentReferenceNotFoundError(txid);
     }
 
-    // `expiredAt` representa o momento de expiração informado pelo PSP.
     const evaluation = evaluatePixExpiration(
       charge.dueDate,
       new Date(expiredAt),
@@ -183,7 +177,7 @@ export class PspWebhooksService {
     }
 
     if (charge.status === 'PAID') {
-      // Uma expiração entregue depois do pagamento não pode sobrescrever PAID.
+      // Uma expiração posterior nunca pode sobrescrever um pagamento confirmado.
       return { chargeId: charge.id, status: 'PAID', event: 'pix.expired' };
     }
 

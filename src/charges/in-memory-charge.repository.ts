@@ -15,11 +15,6 @@ export interface PaginatedCharges {
   readonly limit: number;
 }
 
-/**
- * Armazena cobranças somente durante a execução do processo. O `Map` associa
- * diretamente cada identificador à sua entidade e substitui o valor quando a
- * mesma chave é salva novamente.
- */
 export class InMemoryChargeRepository {
   private readonly charges = new Map<string, Charge>();
 
@@ -39,8 +34,6 @@ export class InMemoryChargeRepository {
     for (const charge of this.charges.values()) {
       const paymentInstrument = charge.paymentInstrument;
 
-      // O discriminador permite ao TypeScript reconhecer os campos exclusivos
-      // do boleto sem cast e sem enfraquecer a verificação de tipos.
       if (
         paymentInstrument.type === 'BOLETO' &&
         paymentInstrument.nossoNumero === nossoNumero
@@ -56,8 +49,6 @@ export class InMemoryChargeRepository {
     for (const charge of this.charges.values()) {
       const paymentInstrument = charge.paymentInstrument;
 
-      // Depois da comparação, a união discriminada é estreitada para Pix e o
-      // acesso a `txid` se torna seguro para o compilador.
       if (paymentInstrument.type === 'PIX' && paymentInstrument.txid === txid) {
         return charge;
       }
@@ -77,11 +68,9 @@ export class InMemoryChargeRepository {
       return matchesStatus && matchesPayerDocument;
     });
 
-    // `total` representa todas as correspondências antes do recorte da página,
-    // enquanto `items` contém somente os elementos da página atual.
     const total = filteredCharges.length;
 
-    // Como `page` começa em 1, subtrair um converte a página em deslocamento.
+    // `total` considera todo o filtro; `items` contém somente a página solicitada.
     const startIndex = (filters.page - 1) * filters.limit;
     const items = filteredCharges.slice(startIndex, startIndex + filters.limit);
 

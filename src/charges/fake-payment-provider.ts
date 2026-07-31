@@ -3,26 +3,15 @@ import { randomUUID } from 'node:crypto';
 import type { PaymentInstrument } from '../domain/payment-instrument';
 import type { PaymentMethod } from '../domain/payment-method';
 
-/**
- * Simula um PSP dentro do próprio processo para permitir o desenvolvimento das
- * regras de cobrança sem depender de uma integração bancária externa nesta fase.
- * Os instrumentos gerados são plausíveis para testes, mas não são códigos
- * bancariamente válidos para pagamentos reais.
- */
+// PSP em processo com latência simulada e dados plausíveis, mas não bancariamente válidos.
 export class FakePaymentProvider {
   private shouldFailNextRequest = false;
 
-  /**
-   * A latência aproxima o comportamento assíncrono de uma chamada externa. O
-   * valor pode ser zero nos testes para mantê-los rápidos.
-   */
   constructor(private readonly latencyInMilliseconds = 10) {}
 
-  /** Gera um instrumento correspondente ao método de pagamento solicitado. */
   async issue(paymentMethod: PaymentMethod): Promise<PaymentInstrument> {
-    // A sinalização é consumida antes da espera para afetar exatamente uma
-    // emissão, fazendo o provedor voltar ao funcionamento normal em seguida.
     const shouldFail = this.shouldFailNextRequest;
+    // A falha é consumida agora para afetar somente esta emissão.
     this.shouldFailNextRequest = false;
 
     await this.delay();
@@ -50,19 +39,16 @@ export class FakePaymentProvider {
     };
   }
 
-  /** Faz somente a próxima chamada de `issue` simular uma falha do PSP. */
   failNextRequest(): void {
     this.shouldFailNextRequest = true;
   }
 
-  /** Aguarda a latência configurada sem bloquear a execução do processo. */
   private delay(): Promise<void> {
     return new Promise((resolve) => {
       setTimeout(resolve, this.latencyInMilliseconds);
     });
   }
 
-  /** Cria uma sequência numérica plausível a partir de UUIDs aleatórios. */
   private createNumericCode(length: number): string {
     let code = '';
 
