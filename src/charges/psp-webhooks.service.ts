@@ -2,6 +2,8 @@ import { Injectable } from '@nestjs/common';
 
 import type { Charge } from '../domain/charge';
 import { calculateBoletoPaymentAmount } from '../domain/boleto-payment-amount';
+import { ChargeStateError } from '../domain/domain-error';
+import { evaluatePixExpiration } from '../domain/pix-expiration';
 import type { PspWebhookDto, PspWebhookEvent } from './dto/psp-webhook.dto';
 import { InMemoryChargeRepository } from './in-memory-charge.repository';
 
@@ -36,6 +38,22 @@ export class PspWebhooksService {
       input.event === 'boleto.paid'
         ? this.findBoleto(input.nossoNumero)
         : this.findPix(input.txid, input.endToEndId);
+
+    if (input.event === 'pix.paid') {
+      // O instante informado pelo PSP determina se o pagamento ocorreu dentro
+      // da tolerância, mesmo quando a entrega do webhook acontecer mais tarde.
+      const evaluation = evaluatePixExpiration(
+        charge.dueDate,
+        new Date(input.paidAt),
+      );
+
+      if (charge.status === 'PENDING' && evaluation.isExpired) {
+        charge.expire();
+        this.repository.save(charge);
+        throw new ChargeStateError('Pix expired before the payment occurred.');
+      }
+    }
+
     const expectedAmount =
       input.event === 'boleto.paid'
         ? calculateBoletoPaymentAmount(

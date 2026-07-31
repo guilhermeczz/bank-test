@@ -616,7 +616,7 @@ describe('AppController (e2e)', () => {
           event: 'pix.paid',
           txid: charge.reference,
           paidAmount: 45_050,
-          paidAt: paidAtForCivilDate(addDaysToCivilDate(dueDate, 10)),
+          paidAt: paidAtForCivilDate(dueDate),
           endToEndId: 'E12345678901234567890',
         })
         .expect(200);
@@ -634,6 +634,100 @@ describe('AppController (e2e)', () => {
       const queryBody: unknown = queryResponse.body;
       assertRecord(queryBody);
       expect(queryBody.status).toBe('PAID');
+    });
+
+    it('pays Pix on the third tolerance day using the original amount', async () => {
+      const dueDate = getFutureDueDate();
+      const charge = await createChargeForWebhook('PIX', dueDate);
+
+      await request(app.getHttpServer())
+        .post('/webhooks/psp')
+        .send({
+          event: 'pix.paid',
+          txid: charge.reference,
+          paidAmount: 45_050,
+          paidAt: paidAtForCivilDate(addDaysToCivilDate(dueDate, 3)),
+          endToEndId: 'E12345678901234567890',
+        })
+        .expect(200);
+    });
+
+    it('rejects Pix on the fourth day and persists the expired status', async () => {
+      const dueDate = getFutureDueDate();
+      const charge = await createChargeForWebhook('PIX', dueDate);
+
+      await request(app.getHttpServer())
+        .post('/webhooks/psp')
+        .send({
+          event: 'pix.paid',
+          txid: charge.reference,
+          paidAmount: 45_050,
+          paidAt: paidAtForCivilDate(addDaysToCivilDate(dueDate, 4)),
+          endToEndId: 'E12345678901234567890',
+        })
+        .expect(409);
+
+      const response = await request(app.getHttpServer())
+        .get(`/charges/${charge.id}`)
+        .expect(200);
+      const body: unknown = response.body;
+      assertRecord(body);
+      expect(body.status).toBe('EXPIRED');
+    });
+
+    it('refreshes expired Pix on query and prevents cancellation', async () => {
+      const dueDate = getFutureDueDate();
+      const charge = await createChargeForWebhook('PIX', dueDate);
+      jest.useFakeTimers();
+      jest.setSystemTime(
+        new Date(`${addDaysToCivilDate(dueDate, 4)}T12:00:00-03:00`),
+      );
+
+      try {
+        const response = await request(app.getHttpServer())
+          .get(`/charges/${charge.id}`)
+          .expect(200);
+        const body: unknown = response.body;
+        assertRecord(body);
+        expect(body.status).toBe('EXPIRED');
+
+        await request(app.getHttpServer())
+          .post(`/charges/${charge.id}/cancel`)
+          .expect(409);
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
+    it('includes lazily expired Pix only in the expired status filter', async () => {
+      const dueDate = getFutureDueDate();
+      const charge = await createChargeForWebhook('PIX', dueDate);
+      jest.useFakeTimers();
+      jest.setSystemTime(
+        new Date(`${addDaysToCivilDate(dueDate, 4)}T12:00:00-03:00`),
+      );
+
+      try {
+        const expiredResponse = await request(app.getHttpServer())
+          .get('/charges')
+          .query({ status: 'EXPIRED' })
+          .expect(200);
+        const expiredBody: unknown = expiredResponse.body;
+        assertRecord(expiredBody);
+        expect(expiredBody.items).toEqual([
+          expect.objectContaining({ id: charge.id, status: 'EXPIRED' }),
+        ]);
+
+        const pendingResponse = await request(app.getHttpServer())
+          .get('/charges')
+          .query({ status: 'PENDING' })
+          .expect(200);
+        const pendingBody: unknown = pendingResponse.body;
+        assertRecord(pendingBody);
+        expect(pendingBody.items).toEqual([]);
+      } finally {
+        jest.useRealTimers();
+      }
     });
 
     it('does not apply boleto fine or interest to Pix', async () => {

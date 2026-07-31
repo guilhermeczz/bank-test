@@ -89,6 +89,40 @@ describe('InMemoryChargeRepository', () => {
     expect(result).toBeNull();
   });
 
+  it('findAll returns every charge', () => {
+    const first = createCharge('charge-1', createBoletoInstrument());
+    const second = createCharge('charge-2', createPixInstrument());
+    repository.save(first);
+    repository.save(second);
+
+    expect(repository.findAll()).toEqual(
+      expect.arrayContaining([first, second]),
+    );
+    expect(repository.findAll()).toHaveLength(2);
+  });
+
+  it('findAll preserves insertion order', () => {
+    const first = createCharge('charge-1', createBoletoInstrument());
+    const second = createCharge('charge-2', createPixInstrument());
+    repository.save(first);
+    repository.save(second);
+
+    expect(repository.findAll()).toEqual([first, second]);
+  });
+
+  it('findAll returns an empty array when the repository is empty', () => {
+    expect(repository.findAll()).toEqual([]);
+  });
+
+  it('changing the findAll result does not remove charges from the Map', () => {
+    repository.save(createCharge('charge-1', createBoletoInstrument()));
+    const result = repository.findAll();
+
+    result.pop();
+
+    expect(repository.count()).toBe(1);
+  });
+
   it('finds a boleto by nossoNumero', () => {
     const charge = createCharge('charge-1', createBoletoInstrument());
     repository.save(charge);

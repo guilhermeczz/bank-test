@@ -178,11 +178,11 @@ describe('PspWebhooksService', () => {
     expect(charge.status).toBe('PAID');
   });
 
-  it('keeps Pix at the original amount after its due date', () => {
+  it('keeps Pix at the original amount during its tolerance period', () => {
     const charge = createCharge('charge-pix', createPixInstrument());
     repository.save(charge);
     const input = createPixInput();
-    input.paidAt = '2026-08-25T12:00:00-03:00';
+    input.paidAt = '2026-08-18T23:59:59-03:00';
 
     expect(() => service.process(input)).not.toThrow();
     expect(charge.status).toBe('PAID');
@@ -197,6 +197,84 @@ describe('PspWebhooksService', () => {
 
     expect(() => service.process(input)).toThrow(PaymentAmountMismatchError);
     expect(charge.status).toBe('PENDING');
+  });
+
+  it.each([
+    ['due date', '2026-08-15T23:59:59-03:00'],
+    ['first tolerance day', '2026-08-16T12:00:00-03:00'],
+    ['third tolerance day', '2026-08-18T23:59:59-03:00'],
+  ])('accepts Pix on the %s', (_name, paidAt) => {
+    const charge = createCharge('charge-pix', createPixInstrument());
+    repository.save(charge);
+    const input = createPixInput();
+    input.paidAt = paidAt;
+
+    expect(() => service.process(input)).not.toThrow();
+    expect(charge.status).toBe('PAID');
+  });
+
+  it('rejects Pix paid on the fourth day after due date', () => {
+    const charge = createCharge('charge-pix', createPixInstrument());
+    repository.save(charge);
+    const input = createPixInput();
+    input.paidAt = '2026-08-19T00:00:00-03:00';
+
+    expect(() => service.process(input)).toThrow(ChargeStateError);
+    expect(charge.status).toBe('EXPIRED');
+  });
+
+  it('saves an expired Pix before rejecting its payment', () => {
+    const charge = createCharge('charge-pix', createPixInstrument());
+    repository.save(charge);
+    const saveSpy = jest.spyOn(repository, 'save');
+    saveSpy.mockClear();
+    const input = createPixInput();
+    input.paidAt = '2026-08-19T12:00:00-03:00';
+
+    expect(() => service.process(input)).toThrow(ChargeStateError);
+    expect(saveSpy).toHaveBeenCalledWith(charge);
+    expect(repository.findById(charge.id)?.status).toBe('EXPIRED');
+  });
+
+  it('does not mark an expired Pix as paid', () => {
+    const charge = createCharge('charge-pix', createPixInstrument());
+    repository.save(charge);
+    const input = createPixInput();
+    input.paidAt = '2026-08-19T12:00:00-03:00';
+
+    expect(() => service.process(input)).toThrow(ChargeStateError);
+    expect(charge.status).not.toBe('PAID');
+  });
+
+  it('uses paidAt instead of the current server date for Pix expiration', () => {
+    const charge = createCharge('charge-pix', createPixInstrument());
+    repository.save(charge);
+    jest.setSystemTime(new Date('2026-09-01T12:00:00-03:00'));
+    const input = createPixInput();
+    input.paidAt = '2026-08-18T23:59:59-03:00';
+
+    expect(() => service.process(input)).not.toThrow();
+    expect(charge.status).toBe('PAID');
+  });
+
+  it('does not transform an already paid Pix into expired', () => {
+    const charge = createCharge('charge-pix', createPixInstrument());
+    charge.markAsPaid();
+    repository.save(charge);
+    const input = createPixInput();
+    input.paidAt = '2026-08-19T12:00:00-03:00';
+
+    expect(() => service.process(input)).toThrow(ChargeStateError);
+    expect(charge.status).toBe('PAID');
+  });
+
+  it('keeps rejecting payment for a cancelled Pix', () => {
+    const charge = createCharge('charge-pix', createPixInstrument());
+    charge.cancel();
+    repository.save(charge);
+
+    expect(() => service.process(createPixInput())).toThrow(ChargeStateError);
+    expect(charge.status).toBe('CANCELLED');
   });
 
   it('saves the updated charge', () => {

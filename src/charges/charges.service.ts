@@ -8,6 +8,7 @@ import { ChargeValidationError } from '../domain/domain-error';
 import type { Payer } from '../domain/payer';
 import { PayerDocument } from '../domain/payer-document';
 import type { PaymentInstrument } from '../domain/payment-instrument';
+import { evaluatePixExpiration } from '../domain/pix-expiration';
 import type { CreateChargeDto } from './dto/create-charge.dto';
 import type { ListChargesQueryDto } from './dto/list-charges-query.dto';
 import { FakePaymentProvider } from './fake-payment-provider';
@@ -92,6 +93,8 @@ export class ChargesService {
       throw new ChargeNotFoundError(id);
     }
 
+    this.refreshPixExpiration(charge, new Date());
+
     return charge;
   }
 
@@ -113,6 +116,11 @@ export class ChargesService {
       query.payerDocument === undefined
         ? undefined
         : new PayerDocument(query.payerDocument).value;
+    const referenceAt = new Date();
+
+    for (const charge of this.repository.findAll()) {
+      this.refreshPixExpiration(charge, referenceAt);
+    }
 
     return this.repository.list({
       status: query.status,
@@ -120,5 +128,22 @@ export class ChargesService {
       page: query.page,
       limit: query.limit,
     });
+  }
+
+  private refreshPixExpiration(charge: Charge, referenceAt: Date): void {
+    if (charge.paymentMethod !== 'PIX' || charge.status !== 'PENDING') {
+      return;
+    }
+
+    const evaluation = evaluatePixExpiration(charge.dueDate, referenceAt);
+
+    if (!evaluation.isExpired) {
+      return;
+    }
+
+    // Nesta implementação in-memory, a atualização preguiçosa substitui um
+    // scheduler e persiste a expiração quando a cobrança volta a ser acessada.
+    charge.expire();
+    this.repository.save(charge);
   }
 }

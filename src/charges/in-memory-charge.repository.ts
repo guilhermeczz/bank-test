@@ -31,6 +31,10 @@ export class InMemoryChargeRepository {
     return this.charges.get(id) ?? null;
   }
 
+  findAll(): Charge[] {
+    return [...this.charges.values()];
+  }
+
   findByNossoNumero(nossoNumero: string): Charge | null {
     for (const charge of this.charges.values()) {
       const paymentInstrument = charge.paymentInstrument;

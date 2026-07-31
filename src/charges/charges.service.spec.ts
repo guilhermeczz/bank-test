@@ -245,4 +245,105 @@ describe('ChargesService', () => {
     expect(result.items).toHaveLength(1);
     expect(result.total).toBe(2);
   });
+
+  it('keeps Pix pending before its due date', async () => {
+    const charge = await createCharge(createInput('PIX'));
+
+    expect(service.findById(charge.id).status).toBe('PENDING');
+  });
+
+  it('keeps Pix pending on the third tolerance day', async () => {
+    const charge = await createCharge(createInput('PIX'));
+    jest.setSystemTime(new Date('2026-08-18T23:59:59-03:00'));
+
+    expect(service.findById(charge.id).status).toBe('PENDING');
+  });
+
+  it('expires Pix on the fourth day after its due date', async () => {
+    const charge = await createCharge(createInput('PIX'));
+    jest.setSystemTime(new Date('2026-08-19T00:00:00-03:00'));
+
+    expect(service.findById(charge.id).status).toBe('EXPIRED');
+  });
+
+  it('saves Pix after refreshing it to expired', async () => {
+    const charge = await createCharge(createInput('PIX'));
+    const saveSpy = jest.spyOn(repository, 'save');
+    saveSpy.mockClear();
+    jest.setSystemTime(new Date('2026-08-19T12:00:00-03:00'));
+
+    service.findById(charge.id);
+
+    expect(saveSpy).toHaveBeenCalledWith(charge);
+    expect(repository.findById(charge.id)?.status).toBe('EXPIRED');
+  });
+
+  it('does not expire an overdue boleto', async () => {
+    const charge = await createCharge(createInput('BOLETO'));
+    jest.setSystemTime(new Date('2026-08-19T12:00:00-03:00'));
+
+    expect(service.findById(charge.id).status).toBe('PENDING');
+  });
+
+  it('does not expire a paid Pix charge', async () => {
+    const charge = await createCharge(createInput('PIX'));
+    charge.markAsPaid();
+    jest.setSystemTime(new Date('2026-08-19T12:00:00-03:00'));
+
+    expect(service.findById(charge.id).status).toBe('PAID');
+  });
+
+  it('does not expire a cancelled Pix charge', async () => {
+    const charge = await createCharge(createInput('PIX'));
+    charge.cancel();
+    jest.setSystemTime(new Date('2026-08-19T12:00:00-03:00'));
+
+    expect(service.findById(charge.id).status).toBe('CANCELLED');
+  });
+
+  it('does not cancel an expired Pix charge', async () => {
+    const charge = await createCharge(createInput('PIX'));
+    jest.setSystemTime(new Date('2026-08-19T12:00:00-03:00'));
+
+    expect(() => service.cancel(charge.id)).toThrow(ChargeStateError);
+    expect(charge.status).toBe('EXPIRED');
+  });
+
+  it('refreshes overdue Pix charges while listing', async () => {
+    const charge = await createCharge(createInput('PIX'));
+    jest.setSystemTime(new Date('2026-08-19T12:00:00-03:00'));
+
+    service.list({ page: 1, limit: 20 });
+
+    expect(charge.status).toBe('EXPIRED');
+  });
+
+  it('finds a refreshed Pix charge with the expired filter', async () => {
+    const charge = await createCharge(createInput('PIX'));
+    jest.setSystemTime(new Date('2026-08-19T12:00:00-03:00'));
+
+    const result = service.list({ status: 'EXPIRED', page: 1, limit: 20 });
+
+    expect(result.items).toEqual([charge]);
+  });
+
+  it('does not return an expired Pix with the pending filter', async () => {
+    await createCharge(createInput('PIX'));
+    jest.setSystemTime(new Date('2026-08-19T12:00:00-03:00'));
+
+    const result = service.list({ status: 'PENDING', page: 1, limit: 20 });
+
+    expect(result.items).toEqual([]);
+  });
+
+  it('keeps pagination after refreshing Pix expiration', async () => {
+    await createCharge(createInput('PIX'));
+    await createCharge(createInput('PIX'));
+    jest.setSystemTime(new Date('2026-08-19T12:00:00-03:00'));
+
+    const result = service.list({ status: 'EXPIRED', page: 2, limit: 1 });
+
+    expect(result.items).toHaveLength(1);
+    expect(result).toMatchObject({ page: 2, limit: 1, total: 2 });
+  });
 });
