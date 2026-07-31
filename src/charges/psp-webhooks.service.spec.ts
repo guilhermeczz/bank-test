@@ -37,13 +37,17 @@ function createPixInstrument(): PaymentInstrument {
   };
 }
 
-function createCharge(id: string, instrument: PaymentInstrument): Charge {
+function createCharge(
+  id: string,
+  instrument: PaymentInstrument,
+  dueDate = '2026-08-15',
+): Charge {
   return new Charge({
     id,
     paymentInstrument: instrument,
     amountInCents: 45_050,
     payer: createPayer(),
-    dueDate: '2026-08-15',
+    dueDate,
     description: 'Cobrança de teste',
   });
 }
@@ -91,6 +95,62 @@ describe('PspWebhooksService', () => {
     expect(result.chargeId).toBe(charge.id);
   });
 
+  it('accepts the original boleto amount before the due date', () => {
+    const charge = createCharge('charge-boleto', createBoletoInstrument());
+    repository.save(charge);
+
+    expect(() => service.process(createBoletoInput())).not.toThrow();
+  });
+
+  it('accepts the original boleto amount on the due date', () => {
+    const charge = createCharge('charge-boleto', createBoletoInstrument());
+    repository.save(charge);
+    const input = createBoletoInput();
+    input.paidAt = '2026-08-15T23:59:59-03:00';
+
+    expect(() => service.process(input)).not.toThrow();
+  });
+
+  it('rejects the original boleto amount one day after the due date', () => {
+    const charge = createCharge('charge-boleto', createBoletoInstrument());
+    repository.save(charge);
+    const input = createBoletoInput();
+    input.paidAt = '2026-08-16T12:00:00-03:00';
+
+    expect(() => service.process(input)).toThrow(PaymentAmountMismatchError);
+  });
+
+  it('accepts a late boleto with the calculated fine and interest', () => {
+    const charge = createCharge('charge-boleto', createBoletoInstrument());
+    repository.save(charge);
+    const input = createBoletoInput();
+    input.paidAt = '2026-08-16T12:00:00-03:00';
+    input.paidAmount = 45_966;
+
+    expect(() => service.process(input)).not.toThrow();
+    expect(charge.status).toBe('PAID');
+  });
+
+  it('uses the calculated amount for several late days', () => {
+    const charge = createCharge('charge-boleto', createBoletoInstrument());
+    repository.save(charge);
+    const input = createBoletoInput();
+    input.paidAt = '2026-08-25T12:00:00-03:00';
+    input.paidAmount = 46_101;
+
+    expect(() => service.process(input)).not.toThrow();
+  });
+
+  it('keeps a late boleto pending when its amount is incorrect', () => {
+    const charge = createCharge('charge-boleto', createBoletoInstrument());
+    repository.save(charge);
+    const input = createBoletoInput();
+    input.paidAt = '2026-08-16T12:00:00-03:00';
+
+    expect(() => service.process(input)).toThrow(PaymentAmountMismatchError);
+    expect(charge.status).toBe('PENDING');
+  });
+
   it('processes Pix using txid', () => {
     const charge = createCharge('charge-pix', createPixInstrument());
     repository.save(charge);
@@ -116,6 +176,27 @@ describe('PspWebhooksService', () => {
     service.process(createPixInput());
 
     expect(charge.status).toBe('PAID');
+  });
+
+  it('keeps Pix at the original amount after its due date', () => {
+    const charge = createCharge('charge-pix', createPixInstrument());
+    repository.save(charge);
+    const input = createPixInput();
+    input.paidAt = '2026-08-25T12:00:00-03:00';
+
+    expect(() => service.process(input)).not.toThrow();
+    expect(charge.status).toBe('PAID');
+  });
+
+  it('does not apply the boleto late amount to Pix', () => {
+    const charge = createCharge('charge-pix', createPixInstrument());
+    repository.save(charge);
+    const input = createPixInput();
+    input.paidAt = '2026-08-16T12:00:00-03:00';
+    input.paidAmount = 45_966;
+
+    expect(() => service.process(input)).toThrow(PaymentAmountMismatchError);
+    expect(charge.status).toBe('PENDING');
   });
 
   it('saves the updated charge', () => {

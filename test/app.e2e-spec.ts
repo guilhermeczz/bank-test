@@ -38,6 +38,35 @@ function readChargeId(body: unknown): string {
   return body.id;
 }
 
+function addDaysToCivilDate(civilDate: string, days: number): string {
+  const [year, month, day] = civilDate.split('-').map(Number);
+  const result = new Date(Date.UTC(year, month - 1, day + days));
+
+  return result.toISOString().slice(0, 10);
+}
+
+function getFutureDueDate(daysFromToday = 10): string {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/Sao_Paulo',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).formatToParts(new Date());
+  const year = parts.find((part) => part.type === 'year')?.value;
+  const month = parts.find((part) => part.type === 'month')?.value;
+  const day = parts.find((part) => part.type === 'day')?.value;
+
+  if (year === undefined || month === undefined || day === undefined) {
+    throw new Error('Could not determine the current civil date.');
+  }
+
+  return addDaysToCivilDate(`${year}-${month}-${day}`, daysFromToday);
+}
+
+function paidAtForCivilDate(civilDate: string): string {
+  return `${civilDate}T12:00:00-03:00`;
+}
+
 describe('AppController (e2e)', () => {
   let app: INestApplication<App>;
   let repository: InMemoryChargeRepository;
@@ -448,9 +477,11 @@ describe('AppController (e2e)', () => {
   describe('POST /webhooks/psp', () => {
     async function createChargeForWebhook(
       paymentMethod: 'BOLETO' | 'PIX',
+      dueDate = getFutureDueDate(),
     ): Promise<{ id: string; reference: string }> {
       const payload = createChargePayload(paymentMethod);
       payload.amount = 45_050;
+      payload.dueDate = dueDate;
       const response = await request(app.getHttpServer())
         .post('/charges')
         .send(payload)
@@ -473,7 +504,8 @@ describe('AppController (e2e)', () => {
     }
 
     it('processes a boleto payment and persists the paid status', async () => {
-      const charge = await createChargeForWebhook('BOLETO');
+      const dueDate = getFutureDueDate();
+      const charge = await createChargeForWebhook('BOLETO', dueDate);
 
       const webhookResponse = await request(app.getHttpServer())
         .post('/webhooks/psp')
@@ -481,7 +513,7 @@ describe('AppController (e2e)', () => {
           event: 'boleto.paid',
           nossoNumero: charge.reference,
           paidAmount: 45_050,
-          paidAt: '2026-08-14T14:32:00-03:00',
+          paidAt: paidAtForCivilDate(addDaysToCivilDate(dueDate, -1)),
         })
         .expect(200);
       const webhookBody: unknown = webhookResponse.body;
@@ -500,8 +532,83 @@ describe('AppController (e2e)', () => {
       expect(queryBody.status).toBe('PAID');
     });
 
+    it('accepts the original boleto amount on its due date', async () => {
+      const dueDate = getFutureDueDate();
+      const charge = await createChargeForWebhook('BOLETO', dueDate);
+
+      await request(app.getHttpServer())
+        .post('/webhooks/psp')
+        .send({
+          event: 'boleto.paid',
+          nossoNumero: charge.reference,
+          paidAmount: 45_050,
+          paidAt: `${dueDate}T23:59:59-03:00`,
+        })
+        .expect(200);
+    });
+
+    it('rejects the original amount one day late and keeps the boleto pending', async () => {
+      const dueDate = getFutureDueDate();
+      const charge = await createChargeForWebhook('BOLETO', dueDate);
+
+      await request(app.getHttpServer())
+        .post('/webhooks/psp')
+        .send({
+          event: 'boleto.paid',
+          nossoNumero: charge.reference,
+          paidAmount: 45_050,
+          paidAt: paidAtForCivilDate(addDaysToCivilDate(dueDate, 1)),
+        })
+        .expect(422);
+
+      const response = await request(app.getHttpServer())
+        .get(`/charges/${charge.id}`)
+        .expect(200);
+      const body: unknown = response.body;
+      assertRecord(body);
+      expect(body.status).toBe('PENDING');
+    });
+
+    it('pays a boleto one day late with the correct fine and interest', async () => {
+      const dueDate = getFutureDueDate();
+      const charge = await createChargeForWebhook('BOLETO', dueDate);
+
+      await request(app.getHttpServer())
+        .post('/webhooks/psp')
+        .send({
+          event: 'boleto.paid',
+          nossoNumero: charge.reference,
+          paidAmount: 45_966,
+          paidAt: paidAtForCivilDate(addDaysToCivilDate(dueDate, 1)),
+        })
+        .expect(200);
+
+      const response = await request(app.getHttpServer())
+        .get(`/charges/${charge.id}`)
+        .expect(200);
+      const body: unknown = response.body;
+      assertRecord(body);
+      expect(body.status).toBe('PAID');
+    });
+
+    it('pays a boleto several days late with the calculated amount', async () => {
+      const dueDate = getFutureDueDate();
+      const charge = await createChargeForWebhook('BOLETO', dueDate);
+
+      await request(app.getHttpServer())
+        .post('/webhooks/psp')
+        .send({
+          event: 'boleto.paid',
+          nossoNumero: charge.reference,
+          paidAmount: 46_101,
+          paidAt: paidAtForCivilDate(addDaysToCivilDate(dueDate, 10)),
+        })
+        .expect(200);
+    });
+
     it('processes a Pix payment and persists the paid status', async () => {
-      const charge = await createChargeForWebhook('PIX');
+      const dueDate = getFutureDueDate();
+      const charge = await createChargeForWebhook('PIX', dueDate);
 
       const webhookResponse = await request(app.getHttpServer())
         .post('/webhooks/psp')
@@ -509,7 +616,7 @@ describe('AppController (e2e)', () => {
           event: 'pix.paid',
           txid: charge.reference,
           paidAmount: 45_050,
-          paidAt: '2026-08-14T09:10:00-03:00',
+          paidAt: paidAtForCivilDate(addDaysToCivilDate(dueDate, 10)),
           endToEndId: 'E12345678901234567890',
         })
         .expect(200);
@@ -527,6 +634,22 @@ describe('AppController (e2e)', () => {
       const queryBody: unknown = queryResponse.body;
       assertRecord(queryBody);
       expect(queryBody.status).toBe('PAID');
+    });
+
+    it('does not apply boleto fine or interest to Pix', async () => {
+      const dueDate = getFutureDueDate();
+      const charge = await createChargeForWebhook('PIX', dueDate);
+
+      await request(app.getHttpServer())
+        .post('/webhooks/psp')
+        .send({
+          event: 'pix.paid',
+          txid: charge.reference,
+          paidAmount: 45_966,
+          paidAt: paidAtForCivilDate(addDaysToCivilDate(dueDate, 1)),
+          endToEndId: 'E12345678901234567890',
+        })
+        .expect(422);
     });
 
     it('returns 404 for an unknown nossoNumero', async () => {
@@ -589,7 +712,8 @@ describe('AppController (e2e)', () => {
     });
 
     it('returns 409 when paying a cancelled charge', async () => {
-      const charge = await createChargeForWebhook('BOLETO');
+      const dueDate = getFutureDueDate();
+      const charge = await createChargeForWebhook('BOLETO', dueDate);
       await request(app.getHttpServer())
         .post(`/charges/${charge.id}/cancel`)
         .expect(200);
@@ -600,7 +724,7 @@ describe('AppController (e2e)', () => {
           event: 'boleto.paid',
           nossoNumero: charge.reference,
           paidAmount: 45_050,
-          paidAt: '2026-08-14T14:32:00-03:00',
+          paidAt: paidAtForCivilDate(dueDate),
         })
         .expect(409);
     });

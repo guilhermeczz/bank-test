@@ -1,6 +1,7 @@
 import { Injectable } from '@nestjs/common';
 
 import type { Charge } from '../domain/charge';
+import { calculateBoletoPaymentAmount } from '../domain/boleto-payment-amount';
 import type { PspWebhookDto, PspWebhookEvent } from './dto/psp-webhook.dto';
 import { InMemoryChargeRepository } from './in-memory-charge.repository';
 
@@ -35,12 +36,17 @@ export class PspWebhooksService {
       input.event === 'boleto.paid'
         ? this.findBoleto(input.nossoNumero)
         : this.findPix(input.txid, input.endToEndId);
+    const expectedAmount =
+      input.event === 'boleto.paid'
+        ? calculateBoletoPaymentAmount(
+            charge.amountInCents,
+            charge.dueDate,
+            input.paidAt,
+          ).expectedAmount
+        : charge.amountInCents;
 
-    if (input.paidAmount !== charge.amountInCents) {
-      throw new PaymentAmountMismatchError(
-        input.paidAmount,
-        charge.amountInCents,
-      );
+    if (input.paidAmount !== expectedAmount) {
+      throw new PaymentAmountMismatchError(input.paidAmount, expectedAmount);
     }
 
     // A entidade decide se o estado atual permite o pagamento; o service não
