@@ -1,6 +1,8 @@
 import { validateChargeAmount } from './charge-amount';
+import { validateDueDate } from './charge-date';
 import type { ChargeStatus } from './charge-status';
-import { ChargeStateError } from './domain-error';
+import { ChargeStateError, ChargeValidationError } from './domain-error';
+import type { Payer } from './payer';
 import type { PaymentInstrument } from './payment-instrument';
 import type { PaymentMethod } from './payment-method';
 
@@ -24,6 +26,15 @@ export interface ChargeProps {
 
   /** Valor original expresso em centavos inteiros, e nunca em reais decimais. */
   amountInCents: number;
+
+  /** Dados do responsável pelo pagamento da cobrança. */
+  payer: Payer;
+
+  /** Data civil de vencimento no formato `YYYY-MM-DD`. */
+  dueDate: string;
+
+  /** Texto que identifica a finalidade da cobrança. */
+  description: string;
 }
 
 /**
@@ -51,6 +62,10 @@ export class Charge {
    */
   private readonly originalAmountInCents: number;
 
+  private readonly chargePayer: Payer;
+  private readonly dueDateValue: string;
+  private readonly chargeDescription: string;
+
   /**
    * O status é privado para que nenhum consumidor possa atribuir estados
    * livremente e ignorar as transições verificadas pelos métodos da entidade.
@@ -65,10 +80,22 @@ export class Charge {
   constructor(props: ChargeProps) {
     const paymentMethod = props.paymentInstrument.type;
     validateChargeAmount(props.amountInCents, paymentMethod);
+    validateDueDate(props.dueDate, new Date());
+
+    // Remover espaços externos evita aceitar um texto visualmente vazio e mantém
+    // a descrição armazenada em uma forma consistente.
+    const description = props.description.trim();
+
+    if (description.length === 0) {
+      throw new ChargeValidationError('Charge description cannot be empty.');
+    }
 
     this.chargeId = props.id;
     this.instrument = props.paymentInstrument;
     this.originalAmountInCents = props.amountInCents;
+    this.chargePayer = props.payer;
+    this.dueDateValue = props.dueDate;
+    this.chargeDescription = description;
     this.currentStatus = 'PENDING';
   }
 
@@ -105,6 +132,18 @@ export class Charge {
    */
   get amountInCents(): number {
     return this.originalAmountInCents;
+  }
+
+  get payer(): Payer {
+    return this.chargePayer;
+  }
+
+  get dueDate(): string {
+    return this.dueDateValue;
+  }
+
+  get description(): string {
+    return this.chargeDescription;
   }
 
   /**
