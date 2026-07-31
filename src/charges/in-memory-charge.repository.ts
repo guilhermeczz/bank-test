@@ -1,4 +1,19 @@
 import type { Charge } from '../domain/charge';
+import type { ChargeStatus } from '../domain/charge-status';
+
+export interface ChargeListFilters {
+  readonly status?: ChargeStatus;
+  readonly payerDocument?: string;
+  readonly page: number;
+  readonly limit: number;
+}
+
+export interface PaginatedCharges {
+  readonly items: Charge[];
+  readonly total: number;
+  readonly page: number;
+  readonly limit: number;
+}
 
 /**
  * Armazena cobranças somente durante a execução do processo. O `Map` associa
@@ -45,6 +60,33 @@ export class InMemoryChargeRepository {
     }
 
     return null;
+  }
+
+  list(filters: ChargeListFilters): PaginatedCharges {
+    const filteredCharges = [...this.charges.values()].filter((charge) => {
+      const matchesStatus =
+        filters.status === undefined || charge.status === filters.status;
+      const matchesPayerDocument =
+        filters.payerDocument === undefined ||
+        charge.payer.document.value === filters.payerDocument;
+
+      return matchesStatus && matchesPayerDocument;
+    });
+
+    // `total` representa todas as correspondências antes do recorte da página,
+    // enquanto `items` contém somente os elementos da página atual.
+    const total = filteredCharges.length;
+
+    // Como `page` começa em 1, subtrair um converte a página em deslocamento.
+    const startIndex = (filters.page - 1) * filters.limit;
+    const items = filteredCharges.slice(startIndex, startIndex + filters.limit);
+
+    return {
+      items,
+      total,
+      page: filters.page,
+      limit: filters.limit,
+    };
   }
 
   count(): number {

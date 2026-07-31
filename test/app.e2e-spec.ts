@@ -1,19 +1,69 @@
+import { INestApplication, ValidationPipe } from '@nestjs/common';
 import { Test, TestingModule } from '@nestjs/testing';
-import { INestApplication } from '@nestjs/common';
 import request from 'supertest';
 import { App } from 'supertest/types';
+
 import { AppModule } from './../src/app.module';
+import { InMemoryChargeRepository } from './../src/charges/in-memory-charge.repository';
+
+function createChargePayload(paymentMethod: 'BOLETO' | 'PIX' = 'BOLETO') {
+  return {
+    payer: {
+      name: 'Maria Souza',
+      document: '529.982.247-25',
+      email: 'maria@example.com',
+    },
+    amount: paymentMethod === 'BOLETO' ? 45_050 : 1,
+    dueDate: '2099-08-15',
+    description: 'Taxa condominial 08/2099',
+    paymentMethod,
+  };
+}
+
+function assertRecord(
+  value: unknown,
+): asserts value is Record<string, unknown> {
+  if (typeof value !== 'object' || value === null) {
+    throw new Error('Expected the response body to be an object.');
+  }
+}
+
+function readChargeId(body: unknown): string {
+  assertRecord(body);
+
+  if (typeof body.id !== 'string') {
+    throw new Error('Expected the response body to contain a charge ID.');
+  }
+
+  return body.id;
+}
 
 describe('AppController (e2e)', () => {
   let app: INestApplication<App>;
+  let repository: InMemoryChargeRepository;
 
-  beforeEach(async () => {
+  beforeAll(async () => {
     const moduleFixture: TestingModule = await Test.createTestingModule({
       imports: [AppModule],
     }).compile();
 
+    repository = moduleFixture.get(InMemoryChargeRepository);
     app = moduleFixture.createNestApplication();
+    app.useGlobalPipes(
+      new ValidationPipe({
+        whitelist: true,
+        transform: true,
+      }),
+    );
     await app.init();
+  });
+
+  beforeEach(() => {
+    repository.clear();
+  });
+
+  afterAll(async () => {
+    await app.close();
   });
 
   it('/ (GET)', () => {
@@ -23,7 +73,375 @@ describe('AppController (e2e)', () => {
       .expect('Hello World!');
   });
 
-  afterEach(async () => {
-    await app.close();
+  describe('POST /charges', () => {
+    it('creates a boleto and returns 201', async () => {
+      await request(app.getHttpServer())
+        .post('/charges')
+        .send(createChargePayload('BOLETO'))
+        .expect(201);
+    });
+
+    it('returns the pending status', async () => {
+      const response = await request(app.getHttpServer())
+        .post('/charges')
+        .send(createChargePayload())
+        .expect(201);
+      const body: unknown = response.body;
+      assertRecord(body);
+
+      expect(body.status).toBe('PENDING');
+    });
+
+    it('returns the normalized payer document', async () => {
+      const response = await request(app.getHttpServer())
+        .post('/charges')
+        .send(createChargePayload())
+        .expect(201);
+      const body: unknown = response.body;
+      assertRecord(body);
+      const payer = body.payer;
+      assertRecord(payer);
+
+      expect(payer.document).toBe('52998224725');
+    });
+
+    it('returns a 47-digit digitable line', async () => {
+      const response = await request(app.getHttpServer())
+        .post('/charges')
+        .send(createChargePayload('BOLETO'))
+        .expect(201);
+      const body: unknown = response.body;
+      assertRecord(body);
+      const paymentInstrument = body.paymentInstrument;
+      assertRecord(paymentInstrument);
+
+      expect(paymentInstrument.digitableLine).toEqual(
+        expect.stringMatching(/^\d{47}$/),
+      );
+    });
+
+    it('creates a Pix charge and returns its txid', async () => {
+      const response = await request(app.getHttpServer())
+        .post('/charges')
+        .send(createChargePayload('PIX'))
+        .expect(201);
+      const body: unknown = response.body;
+      assertRecord(body);
+      const paymentInstrument = body.paymentInstrument;
+      assertRecord(paymentInstrument);
+
+      expect(paymentInstrument.type).toBe('PIX');
+      expect(typeof paymentInstrument.txid).toBe('string');
+      expect(paymentInstrument.txid).not.toBe('');
+    });
+
+    it('returns 400 for an invalid CPF', async () => {
+      const payload = createChargePayload();
+      payload.payer.document = '529.982.247-24';
+
+      await request(app.getHttpServer())
+        .post('/charges')
+        .send(payload)
+        .expect(400);
+    });
+
+    it('returns 400 when a required field is missing', async () => {
+      const payload = createChargePayload();
+
+      await request(app.getHttpServer())
+        .post('/charges')
+        .send({
+          payer: payload.payer,
+          amount: payload.amount,
+          dueDate: payload.dueDate,
+          paymentMethod: payload.paymentMethod,
+        })
+        .expect(400);
+    });
+  });
+
+  describe('GET /charges/:id', () => {
+    it('creates and retrieves a charge by ID', async () => {
+      const creation = await request(app.getHttpServer())
+        .post('/charges')
+        .send(createChargePayload())
+        .expect(201);
+      const id = readChargeId(creation.body);
+
+      await request(app.getHttpServer()).get(`/charges/${id}`).expect(200);
+    });
+
+    it('returns HTTP 200 for an existing charge', async () => {
+      const creation = await request(app.getHttpServer())
+        .post('/charges')
+        .send(createChargePayload())
+        .expect(201);
+      const id = readChargeId(creation.body);
+
+      await request(app.getHttpServer()).get(`/charges/${id}`).expect(200);
+    });
+
+    it('returns the same charge ID', async () => {
+      const creation = await request(app.getHttpServer())
+        .post('/charges')
+        .send(createChargePayload())
+        .expect(201);
+      const id = readChargeId(creation.body);
+
+      const response = await request(app.getHttpServer())
+        .get(`/charges/${id}`)
+        .expect(200);
+      const body: unknown = response.body;
+      assertRecord(body);
+
+      expect(body.id).toBe(id);
+    });
+
+    it('returns the pending status', async () => {
+      const creation = await request(app.getHttpServer())
+        .post('/charges')
+        .send(createChargePayload())
+        .expect(201);
+      const id = readChargeId(creation.body);
+
+      const response = await request(app.getHttpServer())
+        .get(`/charges/${id}`)
+        .expect(200);
+      const body: unknown = response.body;
+      assertRecord(body);
+
+      expect(body.status).toBe('PENDING');
+    });
+
+    it('returns 404 for an unknown ID', async () => {
+      await request(app.getHttpServer())
+        .get('/charges/unknown-charge')
+        .expect(404);
+    });
+  });
+
+  describe('POST /charges/:id/cancel', () => {
+    it('creates and cancels a charge', async () => {
+      const creation = await request(app.getHttpServer())
+        .post('/charges')
+        .send(createChargePayload())
+        .expect(201);
+      const id = readChargeId(creation.body);
+
+      await request(app.getHttpServer())
+        .post(`/charges/${id}/cancel`)
+        .expect(200);
+    });
+
+    it('returns HTTP 200 when cancelling a pending charge', async () => {
+      const creation = await request(app.getHttpServer())
+        .post('/charges')
+        .send(createChargePayload())
+        .expect(201);
+      const id = readChargeId(creation.body);
+
+      await request(app.getHttpServer())
+        .post(`/charges/${id}/cancel`)
+        .expect(200);
+    });
+
+    it('returns the cancelled status', async () => {
+      const creation = await request(app.getHttpServer())
+        .post('/charges')
+        .send(createChargePayload())
+        .expect(201);
+      const id = readChargeId(creation.body);
+
+      const response = await request(app.getHttpServer())
+        .post(`/charges/${id}/cancel`)
+        .expect(200);
+      const body: unknown = response.body;
+      assertRecord(body);
+
+      expect(body.status).toBe('CANCELLED');
+    });
+
+    it('returns 409 when cancelling the same charge again', async () => {
+      const creation = await request(app.getHttpServer())
+        .post('/charges')
+        .send(createChargePayload())
+        .expect(201);
+      const id = readChargeId(creation.body);
+      await request(app.getHttpServer())
+        .post(`/charges/${id}/cancel`)
+        .expect(200);
+
+      await request(app.getHttpServer())
+        .post(`/charges/${id}/cancel`)
+        .expect(409);
+    });
+
+    it('returns 404 when cancelling an unknown ID', async () => {
+      await request(app.getHttpServer())
+        .post('/charges/unknown-charge/cancel')
+        .expect(404);
+    });
+  });
+
+  describe('GET /charges', () => {
+    async function createChargeForList(
+      paymentMethod: 'BOLETO' | 'PIX' = 'BOLETO',
+    ): Promise<string> {
+      const response = await request(app.getHttpServer())
+        .post('/charges')
+        .send(createChargePayload(paymentMethod))
+        .expect(201);
+
+      return readChargeId(response.body);
+    }
+
+    it('returns HTTP 200', async () => {
+      await request(app.getHttpServer()).get('/charges').expect(200);
+    });
+
+    it('returns items, page, limit and total', async () => {
+      const response = await request(app.getHttpServer())
+        .get('/charges')
+        .expect(200);
+      const body: unknown = response.body;
+      assertRecord(body);
+
+      expect(body).toMatchObject({
+        items: [],
+        page: 1,
+        limit: 20,
+        total: 0,
+      });
+    });
+
+    it('lists created charges', async () => {
+      const firstId = await createChargeForList('BOLETO');
+      const secondId = await createChargeForList('PIX');
+
+      const response = await request(app.getHttpServer())
+        .get('/charges')
+        .expect(200);
+      const body: unknown = response.body;
+      assertRecord(body);
+      const items = body.items;
+
+      expect(items).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ id: firstId }),
+          expect.objectContaining({ id: secondId }),
+        ]),
+      );
+    });
+
+    it('filters by pending status', async () => {
+      const pendingId = await createChargeForList();
+      const cancelledId = await createChargeForList();
+      await request(app.getHttpServer())
+        .post(`/charges/${cancelledId}/cancel`)
+        .expect(200);
+
+      const response = await request(app.getHttpServer())
+        .get('/charges')
+        .query({ status: 'PENDING' })
+        .expect(200);
+      const body: unknown = response.body;
+      assertRecord(body);
+
+      expect(body.items).toEqual([
+        expect.objectContaining({ id: pendingId, status: 'PENDING' }),
+      ]);
+    });
+
+    it('filters by cancelled status', async () => {
+      const id = await createChargeForList();
+      await request(app.getHttpServer())
+        .post(`/charges/${id}/cancel`)
+        .expect(200);
+
+      const response = await request(app.getHttpServer())
+        .get('/charges')
+        .query({ status: 'CANCELLED' })
+        .expect(200);
+      const body: unknown = response.body;
+      assertRecord(body);
+
+      expect(body.items).toEqual([
+        expect.objectContaining({ id, status: 'CANCELLED' }),
+      ]);
+    });
+
+    it('filters by an unformatted payer document', async () => {
+      const id = await createChargeForList();
+
+      const response = await request(app.getHttpServer())
+        .get('/charges')
+        .query({ payerDocument: '52998224725' })
+        .expect(200);
+      const body: unknown = response.body;
+      assertRecord(body);
+
+      expect(body.items).toEqual([expect.objectContaining({ id })]);
+    });
+
+    it('filters by a formatted payer document', async () => {
+      const id = await createChargeForList();
+
+      const response = await request(app.getHttpServer())
+        .get('/charges')
+        .query({ payerDocument: '529.982.247-25' })
+        .expect(200);
+      const body: unknown = response.body;
+      assertRecord(body);
+
+      expect(body.items).toEqual([expect.objectContaining({ id })]);
+    });
+
+    it('paginates using page and limit', async () => {
+      await createChargeForList();
+      const secondId = await createChargeForList('PIX');
+      await createChargeForList();
+
+      const response = await request(app.getHttpServer())
+        .get('/charges')
+        .query({ page: 2, limit: 1 })
+        .expect(200);
+      const body: unknown = response.body;
+      assertRecord(body);
+
+      expect(body).toMatchObject({
+        items: [expect.objectContaining({ id: secondId })],
+        page: 2,
+        limit: 1,
+        total: 3,
+      });
+    });
+
+    it('returns 400 for an invalid status', async () => {
+      await request(app.getHttpServer())
+        .get('/charges')
+        .query({ status: 'UNKNOWN' })
+        .expect(400);
+    });
+
+    it('returns 400 when page is zero', async () => {
+      await request(app.getHttpServer())
+        .get('/charges')
+        .query({ page: 0 })
+        .expect(400);
+    });
+
+    it('returns 400 when limit is greater than 100', async () => {
+      await request(app.getHttpServer())
+        .get('/charges')
+        .query({ limit: 101 })
+        .expect(400);
+    });
+
+    it('returns 400 for an invalid payer document', async () => {
+      await request(app.getHttpServer())
+        .get('/charges')
+        .query({ payerDocument: '123' })
+        .expect(400);
+    });
   });
 });
