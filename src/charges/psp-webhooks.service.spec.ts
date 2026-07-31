@@ -5,6 +5,8 @@ import { PayerDocument } from '../domain/payer-document';
 import type { PaymentInstrument } from '../domain/payment-instrument';
 import type { PspWebhookDto } from './dto/psp-webhook.dto';
 import { InMemoryChargeRepository } from './in-memory-charge.repository';
+import { InMemoryPaymentDivergenceRepository } from './in-memory-payment-divergence.repository';
+import { InMemoryProcessedWebhookRepository } from './in-memory-processed-webhook.repository';
 import {
   PaymentAmountMismatchError,
   PaymentReferenceNotFoundError,
@@ -73,13 +75,21 @@ function createPixInput(): PspWebhookDto {
 
 describe('PspWebhooksService', () => {
   let repository: InMemoryChargeRepository;
+  let divergenceRepository: InMemoryPaymentDivergenceRepository;
+  let processedWebhookRepository: InMemoryProcessedWebhookRepository;
   let service: PspWebhooksService;
 
   beforeEach(() => {
     jest.useFakeTimers();
     jest.setSystemTime(new Date('2026-08-10T12:00:00-03:00'));
     repository = new InMemoryChargeRepository();
-    service = new PspWebhooksService(repository);
+    divergenceRepository = new InMemoryPaymentDivergenceRepository();
+    processedWebhookRepository = new InMemoryProcessedWebhookRepository();
+    service = new PspWebhooksService(
+      repository,
+      divergenceRepository,
+      processedWebhookRepository,
+    );
   });
 
   afterEach(() => {
@@ -332,6 +342,277 @@ describe('PspWebhooksService', () => {
 
     expect(() => service.process(input)).toThrow(PaymentAmountMismatchError);
     expect(charge.status).toBe('PENDING');
+  });
+
+  it('registers a divergence for a partial boleto payment', () => {
+    repository.save(createCharge('charge-boleto', createBoletoInstrument()));
+    const input = createBoletoInput();
+    input.paidAmount = 20_000;
+
+    expect(() => service.process(input)).toThrow(PaymentAmountMismatchError);
+
+    expect(divergenceRepository.count()).toBe(1);
+    expect(divergenceRepository.findAll()[0]).toMatchObject({
+      chargeId: 'charge-boleto',
+      event: 'boleto.paid',
+      paymentReference: 'boleto-123456',
+      paidAmount: 20_000,
+      expectedAmount: 45_050,
+      paidAt: input.paidAt,
+      reason: 'AMOUNT_MISMATCH',
+    });
+  });
+
+  it('registers a divergence for a boleto amount above expected', () => {
+    repository.save(createCharge('charge-boleto', createBoletoInstrument()));
+    const input = createBoletoInput();
+    input.paidAmount = 50_000;
+
+    expect(() => service.process(input)).toThrow(PaymentAmountMismatchError);
+
+    expect(divergenceRepository.findAll()[0]?.paidAmount).toBe(50_000);
+  });
+
+  it('stores the late boleto amount including fine and interest as expected', () => {
+    repository.save(createCharge('charge-boleto', createBoletoInstrument()));
+    const input = createBoletoInput();
+    input.paidAt = '2026-08-16T12:00:00-03:00';
+
+    expect(() => service.process(input)).toThrow(PaymentAmountMismatchError);
+
+    expect(divergenceRepository.findAll()[0]?.expectedAmount).toBe(45_966);
+  });
+
+  it.each([
+    ['below', 45_049],
+    ['above', 45_051],
+  ])('registers a Pix amount %s expected', (_name, paidAmount) => {
+    repository.save(createCharge('charge-pix', createPixInstrument()));
+    const input = createPixInput();
+    input.paidAmount = paidAmount;
+
+    expect(() => service.process(input)).toThrow(PaymentAmountMismatchError);
+
+    expect(divergenceRepository.findAll()[0]).toMatchObject({
+      chargeId: 'charge-pix',
+      event: 'pix.paid',
+      paymentReference: 'pix-123456',
+      endToEndId: 'E12345678901234567890',
+      paidAmount,
+      expectedAmount: 45_050,
+      paidAt: input.paidAt,
+      reason: 'AMOUNT_MISMATCH',
+    });
+  });
+
+  it('stores createdAt as the current ISO timestamp', () => {
+    repository.save(createCharge('charge-boleto', createBoletoInstrument()));
+    const input = createBoletoInput();
+    input.paidAmount = 45_049;
+
+    expect(() => service.process(input)).toThrow(PaymentAmountMismatchError);
+
+    const createdAt = divergenceRepository.findAll()[0]?.createdAt;
+    expect(createdAt).toBe('2026-08-10T15:00:00.000Z');
+    expect(new Date(createdAt ?? '').toISOString()).toBe(createdAt);
+  });
+
+  it('does not register divergence for a valid payment', () => {
+    repository.save(createCharge('charge-boleto', createBoletoInstrument()));
+
+    service.process(createBoletoInput());
+
+    expect(divergenceRepository.count()).toBe(0);
+  });
+
+  it('does not register divergence for an unknown reference', () => {
+    expect(() => service.process(createBoletoInput())).toThrow(
+      PaymentReferenceNotFoundError,
+    );
+
+    expect(divergenceRepository.count()).toBe(0);
+  });
+
+  it('does not register divergence for a cancelled charge', () => {
+    const charge = createCharge('charge-boleto', createBoletoInstrument());
+    charge.cancel();
+    repository.save(charge);
+    const input = createBoletoInput();
+    input.paidAmount = 1;
+
+    expect(() => service.process(input)).toThrow(ChargeStateError);
+    expect(divergenceRepository.count()).toBe(0);
+  });
+
+  it('does not register divergence for a paid charge', () => {
+    const charge = createCharge('charge-boleto', createBoletoInstrument());
+    charge.markAsPaid();
+    repository.save(charge);
+    const input = createBoletoInput();
+    input.paidAmount = 1;
+
+    expect(() => service.process(input)).toThrow(ChargeStateError);
+    expect(divergenceRepository.count()).toBe(0);
+  });
+
+  it('does not register monetary divergence for an expired Pix', () => {
+    const charge = createCharge('charge-pix', createPixInstrument());
+    repository.save(charge);
+    const input = createPixInput();
+    input.paidAt = '2026-08-19T12:00:00-03:00';
+    input.paidAmount = 1;
+
+    expect(() => service.process(input)).toThrow(ChargeStateError);
+    expect(charge.status).toBe('EXPIRED');
+    expect(divergenceRepository.count()).toBe(0);
+  });
+
+  it('replays the same successful boleto result without paying again', () => {
+    const charge = createCharge('charge-boleto', createBoletoInstrument());
+    repository.save(charge);
+    const markAsPaidSpy = jest.spyOn(charge, 'markAsPaid');
+    const input = createBoletoInput();
+
+    const firstResult = service.process(input);
+    const repeatedResult = service.process(input);
+
+    expect(repeatedResult).toBe(firstResult);
+    expect(repeatedResult.status).toBe('PAID');
+    expect(markAsPaidSpy).toHaveBeenCalledTimes(1);
+    expect(charge.status).toBe('PAID');
+    expect(processedWebhookRepository.count()).toBe(1);
+  });
+
+  it('replays the same successful Pix result only once', () => {
+    const charge = createCharge('charge-pix', createPixInstrument());
+    repository.save(charge);
+    const input = createPixInput();
+
+    const firstResult = service.process(input);
+    const repeatedResult = service.process(input);
+
+    expect(repeatedResult).toBe(firstResult);
+    expect(charge.status).toBe('PAID');
+    expect(processedWebhookRepository.count()).toBe(1);
+  });
+
+  it('stores an amount mismatch outcome and replays its error', () => {
+    const charge = createCharge('charge-boleto', createBoletoInstrument());
+    repository.save(charge);
+    const input = createBoletoInput();
+    input.paidAmount = 20_000;
+
+    expect(() => service.process(input)).toThrow(PaymentAmountMismatchError);
+    expect(() => service.process(input)).toThrow(PaymentAmountMismatchError);
+
+    expect(processedWebhookRepository.findAll()[0]).toMatchObject({
+      chargeId: charge.id,
+      event: 'boleto.paid',
+      outcome: {
+        type: 'AMOUNT_MISMATCH',
+        paidAmount: 20_000,
+        expectedAmount: 45_050,
+      },
+    });
+    expect(processedWebhookRepository.count()).toBe(1);
+    expect(divergenceRepository.count()).toBe(1);
+    expect(charge.status).toBe('PENDING');
+  });
+
+  it('rejects a different notification for an already paid charge', () => {
+    const charge = createCharge('charge-boleto', createBoletoInstrument());
+    repository.save(charge);
+    service.process(createBoletoInput());
+    const differentInput = createBoletoInput();
+    differentInput.paidAmount = 45_051;
+
+    expect(() => service.process(differentInput)).toThrow(ChargeStateError);
+    expect(processedWebhookRepository.count()).toBe(1);
+  });
+
+  it('does not store a processed webhook for an unknown reference', () => {
+    expect(() => service.process(createBoletoInput())).toThrow(
+      PaymentReferenceNotFoundError,
+    );
+
+    expect(processedWebhookRepository.count()).toBe(0);
+  });
+
+  it('does not store a processed webhook for a cancelled charge', () => {
+    const charge = createCharge('charge-boleto', createBoletoInstrument());
+    charge.cancel();
+    repository.save(charge);
+
+    expect(() => service.process(createBoletoInput())).toThrow(
+      ChargeStateError,
+    );
+    expect(processedWebhookRepository.count()).toBe(0);
+  });
+
+  it('does not store a processed webhook for an expired Pix', () => {
+    const charge = createCharge('charge-pix', createPixInstrument());
+    repository.save(charge);
+    const input = createPixInput();
+    input.paidAt = '2026-08-19T12:00:00-03:00';
+
+    expect(() => service.process(input)).toThrow(ChargeStateError);
+    expect(processedWebhookRepository.count()).toBe(0);
+  });
+
+  it('stores processedAt as a valid current ISO timestamp', () => {
+    repository.save(createCharge('charge-boleto', createBoletoInstrument()));
+
+    service.process(createBoletoInput());
+
+    const processedAt = processedWebhookRepository.findAll()[0]?.processedAt;
+    expect(processedAt).toBe('2026-08-10T15:00:00.000Z');
+    expect(new Date(processedAt ?? '').toISOString()).toBe(processedAt);
+  });
+
+  it('treats equivalent paidAt offsets as the same notification', () => {
+    const charge = createCharge('charge-boleto', createBoletoInstrument());
+    repository.save(charge);
+    const firstInput = createBoletoInput();
+    const equivalentInput = createBoletoInput();
+    equivalentInput.paidAt = '2026-08-14T17:32:00.000Z';
+
+    const firstResult = service.process(firstInput);
+    const repeatedResult = service.process(equivalentInput);
+
+    expect(repeatedResult).toBe(firstResult);
+    expect(processedWebhookRepository.count()).toBe(1);
+  });
+
+  it('generates different keys for boleto and Pix notifications', () => {
+    const boleto = createCharge('charge-boleto', createBoletoInstrument());
+    const pix = createCharge('charge-pix', createPixInstrument());
+    repository.save(boleto);
+    repository.save(pix);
+
+    service.process(createBoletoInput());
+    service.process(createPixInput());
+
+    const [first, second] = processedWebhookRepository.findAll();
+    expect(first?.key).not.toBe(second?.key);
+    expect(processedWebhookRepository.count()).toBe(2);
+  });
+
+  it('generates different keys for genuinely different payloads', () => {
+    repository.save(createCharge('charge-boleto', createBoletoInstrument()));
+    const firstInput = createBoletoInput();
+    firstInput.paidAmount = 1;
+    const secondInput = createBoletoInput();
+    secondInput.paidAmount = 2;
+
+    expect(() => service.process(firstInput)).toThrow(
+      PaymentAmountMismatchError,
+    );
+    expect(() => service.process(secondInput)).toThrow(
+      PaymentAmountMismatchError,
+    );
+
+    expect(processedWebhookRepository.count()).toBe(2);
+    expect(divergenceRepository.count()).toBe(2);
   });
 
   it('does not pay a cancelled charge', () => {

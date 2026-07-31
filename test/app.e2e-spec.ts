@@ -5,6 +5,8 @@ import { App } from 'supertest/types';
 
 import { AppModule } from './../src/app.module';
 import { InMemoryChargeRepository } from './../src/charges/in-memory-charge.repository';
+import { InMemoryPaymentDivergenceRepository } from './../src/charges/in-memory-payment-divergence.repository';
+import { InMemoryProcessedWebhookRepository } from './../src/charges/in-memory-processed-webhook.repository';
 
 function createChargePayload(paymentMethod: 'BOLETO' | 'PIX' = 'BOLETO') {
   return {
@@ -70,6 +72,8 @@ function paidAtForCivilDate(civilDate: string): string {
 describe('AppController (e2e)', () => {
   let app: INestApplication<App>;
   let repository: InMemoryChargeRepository;
+  let divergenceRepository: InMemoryPaymentDivergenceRepository;
+  let processedWebhookRepository: InMemoryProcessedWebhookRepository;
 
   beforeAll(async () => {
     const moduleFixture: TestingModule = await Test.createTestingModule({
@@ -77,6 +81,12 @@ describe('AppController (e2e)', () => {
     }).compile();
 
     repository = moduleFixture.get(InMemoryChargeRepository);
+    divergenceRepository = moduleFixture.get(
+      InMemoryPaymentDivergenceRepository,
+    );
+    processedWebhookRepository = moduleFixture.get(
+      InMemoryProcessedWebhookRepository,
+    );
     app = moduleFixture.createNestApplication();
     app.useGlobalPipes(
       new ValidationPipe({
@@ -89,6 +99,8 @@ describe('AppController (e2e)', () => {
 
   beforeEach(() => {
     repository.clear();
+    divergenceRepository.clear();
+    processedWebhookRepository.clear();
   });
 
   afterAll(async () => {
@@ -803,6 +815,300 @@ describe('AppController (e2e)', () => {
       const body: unknown = response.body;
       assertRecord(body);
       expect(body.status).toBe('PENDING');
+    });
+
+    it('stores a partial boleto payment divergence and keeps it pending', async () => {
+      const dueDate = getFutureDueDate();
+      const charge = await createChargeForWebhook('BOLETO', dueDate);
+
+      await request(app.getHttpServer())
+        .post('/webhooks/psp')
+        .send({
+          event: 'boleto.paid',
+          nossoNumero: charge.reference,
+          paidAmount: 20_000,
+          paidAt: paidAtForCivilDate(dueDate),
+        })
+        .expect(422);
+
+      const divergences = divergenceRepository.findByChargeId(charge.id);
+      expect(divergences).toHaveLength(1);
+      expect(divergences[0]).toMatchObject({
+        chargeId: charge.id,
+        paymentReference: charge.reference,
+        paidAmount: 20_000,
+        expectedAmount: 45_050,
+      });
+
+      const response = await request(app.getHttpServer())
+        .get(`/charges/${charge.id}`)
+        .expect(200);
+      const body: unknown = response.body;
+      assertRecord(body);
+      expect(body.status).toBe('PENDING');
+    });
+
+    it('stores a new divergence for a boleto payment above expected', async () => {
+      const dueDate = getFutureDueDate();
+      const charge = await createChargeForWebhook('BOLETO', dueDate);
+
+      await request(app.getHttpServer())
+        .post('/webhooks/psp')
+        .send({
+          event: 'boleto.paid',
+          nossoNumero: charge.reference,
+          paidAmount: 50_000,
+          paidAt: paidAtForCivilDate(dueDate),
+        })
+        .expect(422);
+      await request(app.getHttpServer())
+        .post('/webhooks/psp')
+        .send({
+          event: 'boleto.paid',
+          nossoNumero: charge.reference,
+          paidAmount: 50_001,
+          paidAt: paidAtForCivilDate(dueDate),
+        })
+        .expect(422);
+
+      expect(divergenceRepository.findByChargeId(charge.id)).toHaveLength(2);
+    });
+
+    it('stores the late boleto amount with fine and interest as expected', async () => {
+      const dueDate = getFutureDueDate();
+      const charge = await createChargeForWebhook('BOLETO', dueDate);
+
+      await request(app.getHttpServer())
+        .post('/webhooks/psp')
+        .send({
+          event: 'boleto.paid',
+          nossoNumero: charge.reference,
+          paidAmount: 45_050,
+          paidAt: paidAtForCivilDate(addDaysToCivilDate(dueDate, 1)),
+        })
+        .expect(422);
+
+      expect(
+        divergenceRepository.findByChargeId(charge.id)[0]?.expectedAmount,
+      ).toBe(45_966);
+    });
+
+    it('stores Pix divergence with txid and endToEndId', async () => {
+      const dueDate = getFutureDueDate();
+      const charge = await createChargeForWebhook('PIX', dueDate);
+
+      await request(app.getHttpServer())
+        .post('/webhooks/psp')
+        .send({
+          event: 'pix.paid',
+          txid: charge.reference,
+          paidAmount: 45_049,
+          paidAt: paidAtForCivilDate(dueDate),
+          endToEndId: 'E12345678901234567890',
+        })
+        .expect(422);
+
+      expect(divergenceRepository.findByChargeId(charge.id)[0]).toMatchObject({
+        event: 'pix.paid',
+        paymentReference: charge.reference,
+        endToEndId: 'E12345678901234567890',
+        paidAmount: 45_049,
+        expectedAmount: 45_050,
+      });
+    });
+
+    it('does not store divergence for a correct payment', async () => {
+      const dueDate = getFutureDueDate();
+      const charge = await createChargeForWebhook('BOLETO', dueDate);
+
+      await request(app.getHttpServer())
+        .post('/webhooks/psp')
+        .send({
+          event: 'boleto.paid',
+          nossoNumero: charge.reference,
+          paidAmount: 45_050,
+          paidAt: paidAtForCivilDate(dueDate),
+        })
+        .expect(200);
+
+      expect(divergenceRepository.count()).toBe(0);
+    });
+
+    it('does not store divergence for an unknown reference', async () => {
+      await request(app.getHttpServer())
+        .post('/webhooks/psp')
+        .send({
+          event: 'boleto.paid',
+          nossoNumero: 'unknown-reference',
+          paidAmount: 1,
+          paidAt: paidAtForCivilDate(getFutureDueDate()),
+        })
+        .expect(404);
+
+      expect(divergenceRepository.count()).toBe(0);
+    });
+
+    it('does not store divergence for a cancelled charge', async () => {
+      const dueDate = getFutureDueDate();
+      const charge = await createChargeForWebhook('BOLETO', dueDate);
+      await request(app.getHttpServer())
+        .post(`/charges/${charge.id}/cancel`)
+        .expect(200);
+
+      await request(app.getHttpServer())
+        .post('/webhooks/psp')
+        .send({
+          event: 'boleto.paid',
+          nossoNumero: charge.reference,
+          paidAmount: 1,
+          paidAt: paidAtForCivilDate(dueDate),
+        })
+        .expect(409);
+
+      expect(divergenceRepository.count()).toBe(0);
+    });
+
+    it('does not store monetary divergence for an expired Pix', async () => {
+      const dueDate = getFutureDueDate();
+      const charge = await createChargeForWebhook('PIX', dueDate);
+
+      await request(app.getHttpServer())
+        .post('/webhooks/psp')
+        .send({
+          event: 'pix.paid',
+          txid: charge.reference,
+          paidAmount: 1,
+          paidAt: paidAtForCivilDate(addDaysToCivilDate(dueDate, 4)),
+          endToEndId: 'E12345678901234567890',
+        })
+        .expect(409);
+
+      expect(divergenceRepository.count()).toBe(0);
+    });
+
+    it('replays an identical boleto webhook without paying twice', async () => {
+      const dueDate = getFutureDueDate();
+      const charge = await createChargeForWebhook('BOLETO', dueDate);
+      const payload = {
+        event: 'boleto.paid',
+        nossoNumero: charge.reference,
+        paidAmount: 45_050,
+        paidAt: paidAtForCivilDate(dueDate),
+      };
+
+      const first = await request(app.getHttpServer())
+        .post('/webhooks/psp')
+        .send(payload)
+        .expect(200);
+      const repeated = await request(app.getHttpServer())
+        .post('/webhooks/psp')
+        .send(payload)
+        .expect(200);
+
+      expect(repeated.body).toEqual(first.body);
+      expect(processedWebhookRepository.count()).toBe(1);
+
+      const response = await request(app.getHttpServer())
+        .get(`/charges/${charge.id}`)
+        .expect(200);
+      const body: unknown = response.body;
+      assertRecord(body);
+      expect(body.status).toBe('PAID');
+    });
+
+    it('replays an identical Pix webhook with one processed record', async () => {
+      const dueDate = getFutureDueDate();
+      const charge = await createChargeForWebhook('PIX', dueDate);
+      const payload = {
+        event: 'pix.paid',
+        txid: charge.reference,
+        paidAmount: 45_050,
+        paidAt: paidAtForCivilDate(dueDate),
+        endToEndId: 'E12345678901234567890',
+      };
+
+      const first = await request(app.getHttpServer())
+        .post('/webhooks/psp')
+        .send(payload)
+        .expect(200);
+      const repeated = await request(app.getHttpServer())
+        .post('/webhooks/psp')
+        .send(payload)
+        .expect(200);
+
+      expect(repeated.body).toEqual(first.body);
+      expect(processedWebhookRepository.count()).toBe(1);
+    });
+
+    it('replays a divergence without creating another divergence', async () => {
+      const dueDate = getFutureDueDate();
+      const charge = await createChargeForWebhook('BOLETO', dueDate);
+      const payload = {
+        event: 'boleto.paid',
+        nossoNumero: charge.reference,
+        paidAmount: 20_000,
+        paidAt: paidAtForCivilDate(dueDate),
+      };
+
+      await request(app.getHttpServer())
+        .post('/webhooks/psp')
+        .send(payload)
+        .expect(422);
+      await request(app.getHttpServer())
+        .post('/webhooks/psp')
+        .send(payload)
+        .expect(422);
+
+      expect(divergenceRepository.count()).toBe(1);
+      expect(processedWebhookRepository.count()).toBe(1);
+
+      const response = await request(app.getHttpServer())
+        .get(`/charges/${charge.id}`)
+        .expect(200);
+      const body: unknown = response.body;
+      assertRecord(body);
+      expect(body.status).toBe('PENDING');
+    });
+
+    it('rejects and does not store a different webhook for a paid charge', async () => {
+      const dueDate = getFutureDueDate();
+      const charge = await createChargeForWebhook('BOLETO', dueDate);
+      const paidAt = paidAtForCivilDate(dueDate);
+      await request(app.getHttpServer())
+        .post('/webhooks/psp')
+        .send({
+          event: 'boleto.paid',
+          nossoNumero: charge.reference,
+          paidAmount: 45_050,
+          paidAt,
+        })
+        .expect(200);
+
+      await request(app.getHttpServer())
+        .post('/webhooks/psp')
+        .send({
+          event: 'boleto.paid',
+          nossoNumero: charge.reference,
+          paidAmount: 45_051,
+          paidAt,
+        })
+        .expect(409);
+
+      expect(processedWebhookRepository.count()).toBe(1);
+    });
+
+    it('does not store an unknown reference as a processed webhook', async () => {
+      await request(app.getHttpServer())
+        .post('/webhooks/psp')
+        .send({
+          event: 'boleto.paid',
+          nossoNumero: 'unknown-reference',
+          paidAmount: 45_050,
+          paidAt: paidAtForCivilDate(getFutureDueDate()),
+        })
+        .expect(404);
+
+      expect(processedWebhookRepository.count()).toBe(0);
     });
 
     it('returns 409 when paying a cancelled charge', async () => {
