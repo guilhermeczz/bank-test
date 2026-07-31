@@ -34,3 +34,16 @@ export class ChargeValidationError extends Error {
     this.name = 'ChargeValidationError';
   }
 }
+
+/**
+ * Representa um CPF ou CNPJ que não atende às regras de formato ou aos cálculos
+ * dos dígitos verificadores. Um erro próprio permite distinguir essa validação
+ * das regras de valor e das transições de estado da cobrança.
+ */
+export class PayerDocumentValidationError extends Error {
+  /** Inicializa o erro padrão e define um nome específico para identificação. */
+  constructor(message: string) {
+    super(message);
+    this.name = 'PayerDocumentValidationError';
+  }
+}
