@@ -5,6 +5,7 @@ import { App } from 'supertest/types';
 
 import { AppModule } from './../src/app.module';
 import { InMemoryChargeRepository } from './../src/charges/in-memory-charge.repository';
+import { InMemoryIdempotentChargeRequestRepository } from './../src/charges/in-memory-idempotent-charge-request.repository';
 import { InMemoryPaymentDivergenceRepository } from './../src/charges/in-memory-payment-divergence.repository';
 import { InMemoryProcessedWebhookRepository } from './../src/charges/in-memory-processed-webhook.repository';
 
@@ -72,6 +73,7 @@ function paidAtForCivilDate(civilDate: string): string {
 describe('AppController (e2e)', () => {
   let app: INestApplication<App>;
   let repository: InMemoryChargeRepository;
+  let idempotencyRepository: InMemoryIdempotentChargeRequestRepository;
   let divergenceRepository: InMemoryPaymentDivergenceRepository;
   let processedWebhookRepository: InMemoryProcessedWebhookRepository;
 
@@ -81,6 +83,9 @@ describe('AppController (e2e)', () => {
     }).compile();
 
     repository = moduleFixture.get(InMemoryChargeRepository);
+    idempotencyRepository = moduleFixture.get(
+      InMemoryIdempotentChargeRequestRepository,
+    );
     divergenceRepository = moduleFixture.get(
       InMemoryPaymentDivergenceRepository,
     );
@@ -99,6 +104,7 @@ describe('AppController (e2e)', () => {
 
   beforeEach(() => {
     repository.clear();
+    idempotencyRepository.clear();
     divergenceRepository.clear();
     processedWebhookRepository.clear();
   });
@@ -197,6 +203,99 @@ describe('AppController (e2e)', () => {
           dueDate: payload.dueDate,
           paymentMethod: payload.paymentMethod,
         })
+        .expect(400);
+    });
+
+    it('replays creation with the same Idempotency-Key and payload', async () => {
+      const payload = createChargePayload();
+      const first = await request(app.getHttpServer())
+        .post('/charges')
+        .set('Idempotency-Key', 'condominium-charge-2026-08')
+        .send(payload)
+        .expect(201);
+      const repeated = await request(app.getHttpServer())
+        .post('/charges')
+        .set('Idempotency-Key', 'condominium-charge-2026-08')
+        .send(payload)
+        .expect(201);
+      const firstBody: unknown = first.body;
+      const repeatedBody: unknown = repeated.body;
+      assertRecord(firstBody);
+      assertRecord(repeatedBody);
+
+      expect(repeatedBody.id).toBe(firstBody.id);
+      expect(repeatedBody.paymentInstrument).toEqual(
+        firstBody.paymentInstrument,
+      );
+      expect(repository.count()).toBe(1);
+      expect(idempotencyRepository.count()).toBe(1);
+    });
+
+    it('returns 409 for the same key with a different amount', async () => {
+      const payload = createChargePayload();
+      await request(app.getHttpServer())
+        .post('/charges')
+        .set('Idempotency-Key', 'charge-key')
+        .send(payload)
+        .expect(201);
+
+      await request(app.getHttpServer())
+        .post('/charges')
+        .set('Idempotency-Key', 'charge-key')
+        .send({ ...payload, amount: payload.amount + 1 })
+        .expect(409);
+
+      expect(repository.count()).toBe(1);
+      expect(idempotencyRepository.count()).toBe(1);
+    });
+
+    it('creates another charge for a different key and equal payload', async () => {
+      const payload = createChargePayload();
+      const first = await request(app.getHttpServer())
+        .post('/charges')
+        .set('Idempotency-Key', 'charge-key-1')
+        .send(payload)
+        .expect(201);
+      const second = await request(app.getHttpServer())
+        .post('/charges')
+        .set('Idempotency-Key', 'charge-key-2')
+        .send(payload)
+        .expect(201);
+
+      expect(readChargeId(second.body)).not.toBe(readChargeId(first.body));
+      expect(repository.count()).toBe(2);
+      expect(idempotencyRepository.count()).toBe(2);
+    });
+
+    it('creates different charges when the header is absent', async () => {
+      const payload = createChargePayload();
+      const first = await request(app.getHttpServer())
+        .post('/charges')
+        .send(payload)
+        .expect(201);
+      const second = await request(app.getHttpServer())
+        .post('/charges')
+        .send(payload)
+        .expect(201);
+
+      expect(readChargeId(second.body)).not.toBe(readChargeId(first.body));
+      expect(repository.count()).toBe(2);
+      expect(idempotencyRepository.count()).toBe(0);
+    });
+
+    it('returns 400 for an empty Idempotency-Key', async () => {
+      await request(app.getHttpServer())
+        .post('/charges')
+        .set('Idempotency-Key', '')
+        .send(createChargePayload())
+        .expect(400);
+    });
+
+    it('returns 400 for an Idempotency-Key above the limit', async () => {
+      await request(app.getHttpServer())
+        .post('/charges')
+        .set('Idempotency-Key', 'a'.repeat(256))
+        .send(createChargePayload())
         .expect(400);
     });
   });
@@ -1109,6 +1208,158 @@ describe('AppController (e2e)', () => {
         .expect(404);
 
       expect(processedWebhookRepository.count()).toBe(0);
+    });
+
+    it('expires Pix and safely accepts the repeated expiration event', async () => {
+      const dueDate = getFutureDueDate();
+      const charge = await createChargeForWebhook('PIX', dueDate);
+      const payload = {
+        event: 'pix.expired',
+        txid: charge.reference,
+        expiredAt: paidAtForCivilDate(addDaysToCivilDate(dueDate, 4)),
+      };
+
+      const first = await request(app.getHttpServer())
+        .post('/webhooks/psp')
+        .send(payload)
+        .expect(200);
+      const repeated = await request(app.getHttpServer())
+        .post('/webhooks/psp')
+        .send(payload)
+        .expect(200);
+      expect(first.body).toMatchObject({
+        chargeId: charge.id,
+        status: 'EXPIRED',
+        event: 'pix.expired',
+      });
+      expect(repeated.body).toEqual(first.body);
+
+      const response = await request(app.getHttpServer())
+        .get(`/charges/${charge.id}`)
+        .expect(200);
+      const body: unknown = response.body;
+      assertRecord(body);
+      expect(body.status).toBe('EXPIRED');
+    });
+
+    it('ignores Pix expiration received after payment', async () => {
+      const dueDate = getFutureDueDate();
+      const charge = await createChargeForWebhook('PIX', dueDate);
+      await request(app.getHttpServer())
+        .post('/webhooks/psp')
+        .send({
+          event: 'pix.paid',
+          txid: charge.reference,
+          paidAmount: 45_050,
+          paidAt: paidAtForCivilDate(dueDate),
+          endToEndId: 'E12345678901234567890',
+        })
+        .expect(200);
+
+      const expiration = await request(app.getHttpServer())
+        .post('/webhooks/psp')
+        .send({
+          event: 'pix.expired',
+          txid: charge.reference,
+          expiredAt: paidAtForCivilDate(addDaysToCivilDate(dueDate, 4)),
+        })
+        .expect(200);
+      expect(expiration.body).toMatchObject({
+        chargeId: charge.id,
+        status: 'PAID',
+        event: 'pix.expired',
+      });
+
+      const response = await request(app.getHttpServer())
+        .get(`/charges/${charge.id}`)
+        .expect(200);
+      const body: unknown = response.body;
+      assertRecord(body);
+      expect(body.status).toBe('PAID');
+    });
+
+    it('rejects premature Pix expiration and keeps it pending', async () => {
+      const dueDate = getFutureDueDate();
+      const charge = await createChargeForWebhook('PIX', dueDate);
+
+      await request(app.getHttpServer())
+        .post('/webhooks/psp')
+        .send({
+          event: 'pix.expired',
+          txid: charge.reference,
+          expiredAt: paidAtForCivilDate(addDaysToCivilDate(dueDate, 3)),
+        })
+        .expect(422);
+
+      const response = await request(app.getHttpServer())
+        .get(`/charges/${charge.id}`)
+        .expect(200);
+      const body: unknown = response.body;
+      assertRecord(body);
+      expect(body.status).toBe('PENDING');
+    });
+
+    it('reconciles timely pix.paid received after expiration', async () => {
+      const dueDate = getFutureDueDate();
+      const charge = await createChargeForWebhook('PIX', dueDate);
+      await request(app.getHttpServer())
+        .post('/webhooks/psp')
+        .send({
+          event: 'pix.expired',
+          txid: charge.reference,
+          expiredAt: paidAtForCivilDate(addDaysToCivilDate(dueDate, 4)),
+        })
+        .expect(200);
+
+      await request(app.getHttpServer())
+        .post('/webhooks/psp')
+        .send({
+          event: 'pix.paid',
+          txid: charge.reference,
+          paidAmount: 45_050,
+          paidAt: paidAtForCivilDate(addDaysToCivilDate(dueDate, 3)),
+          endToEndId: 'E12345678901234567890',
+        })
+        .expect(200);
+
+      const response = await request(app.getHttpServer())
+        .get(`/charges/${charge.id}`)
+        .expect(200);
+      const body: unknown = response.body;
+      assertRecord(body);
+      expect(body.status).toBe('PAID');
+    });
+
+    it('keeps expired Pix rejected when paidAt is after tolerance', async () => {
+      const dueDate = getFutureDueDate();
+      const charge = await createChargeForWebhook('PIX', dueDate);
+      const afterTolerance = paidAtForCivilDate(addDaysToCivilDate(dueDate, 4));
+      await request(app.getHttpServer())
+        .post('/webhooks/psp')
+        .send({
+          event: 'pix.expired',
+          txid: charge.reference,
+          expiredAt: afterTolerance,
+        })
+        .expect(200);
+
+      await request(app.getHttpServer())
+        .post('/webhooks/psp')
+        .send({
+          event: 'pix.paid',
+          txid: charge.reference,
+          paidAmount: 45_050,
+          paidAt: afterTolerance,
+          endToEndId: 'E12345678901234567890',
+        })
+        .expect(409);
+
+      const response = await request(app.getHttpServer())
+        .get(`/charges/${charge.id}`)
+        .expect(200);
+      const body: unknown = response.body;
+      assertRecord(body);
+      expect(body.status).toBe('EXPIRED');
     });
 
     it('returns 409 when paying a cancelled charge', async () => {

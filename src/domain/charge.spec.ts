@@ -262,6 +262,89 @@ describe('Charge', () => {
     });
   });
 
+  describe('reconcileExpiredPixPayment', () => {
+    it.each([
+      ['on the due date', '2026-08-15T12:00:00-03:00'],
+      ['on the third tolerance day', '2026-08-18T23:59:59-03:00'],
+    ])('reconciles expired Pix %s', (_name, paidAt) => {
+      const charge = createPixCharge();
+      charge.expire();
+
+      charge.reconcileExpiredPixPayment(new Date(paidAt));
+
+      expect(charge.status).toBe('PAID');
+    });
+
+    it('rejects a payment made on the fourth day', () => {
+      const charge = createPixCharge();
+      charge.expire();
+
+      expect(() =>
+        charge.reconcileExpiredPixPayment(
+          new Date('2026-08-19T00:00:00-03:00'),
+        ),
+      ).toThrow(ChargeStateError);
+      expect(charge.status).toBe('EXPIRED');
+    });
+
+    it('changes reconciled Pix status to paid', () => {
+      const charge = createPixCharge();
+      charge.expire();
+
+      charge.reconcileExpiredPixPayment(new Date('2026-08-15T12:00:00-03:00'));
+
+      expect(charge.status).toBe('PAID');
+    });
+
+    it('keeps Pix expired after rejecting a late reconciliation', () => {
+      const charge = createPixCharge();
+      charge.expire();
+
+      expect(() =>
+        charge.reconcileExpiredPixPayment(
+          new Date('2026-08-19T12:00:00-03:00'),
+        ),
+      ).toThrow(ChargeStateError);
+      expect(charge.status).toBe('EXPIRED');
+    });
+
+    it('rejects reconciliation for boleto', () => {
+      expect(() =>
+        createBoletoCharge().reconcileExpiredPixPayment(
+          new Date('2026-08-15T12:00:00-03:00'),
+        ),
+      ).toThrow(ChargeStateError);
+    });
+
+    it.each(['PENDING', 'PAID', 'CANCELLED'] as const)(
+      'rejects reconciliation for Pix with status %s',
+      (status) => {
+        const charge = createPixCharge();
+
+        if (status === 'PAID') {
+          charge.markAsPaid();
+        } else if (status === 'CANCELLED') {
+          charge.cancel();
+        }
+
+        expect(() =>
+          charge.reconcileExpiredPixPayment(
+            new Date('2026-08-15T12:00:00-03:00'),
+          ),
+        ).toThrow(ChargeStateError);
+      },
+    );
+
+    it('rejects an invalid payment date', () => {
+      const charge = createPixCharge();
+      charge.expire();
+
+      expect(() =>
+        charge.reconcileExpiredPixPayment(new Date('invalid')),
+      ).toThrow(ChargeStateError);
+    });
+  });
+
   /**
    * Estes testes exercitam os valores exatamente nos limites e imediatamente
    * fora deles. Isso ajuda a detectar comparações inclusivas incorretas sem

@@ -5,6 +5,7 @@ import { ChargeStateError, ChargeValidationError } from './domain-error';
 import type { Payer } from './payer';
 import type { PaymentInstrument } from './payment-instrument';
 import type { PaymentMethod } from './payment-method';
+import { evaluatePixExpiration } from './pix-expiration';
 
 /**
  * Este arquivo contém a primeira versão da entidade de domínio Charge. Uma
@@ -191,5 +192,35 @@ export class Charge {
     }
 
     this.currentStatus = 'EXPIRED';
+  }
+
+  /**
+   * Reconcilia uma confirmação que chegou depois de a cobrança ter sido marcada
+   * como expirada, embora `paidAt` comprove que o pagamento ocorreu no prazo.
+   */
+  reconcileExpiredPixPayment(paidAt: Date): void {
+    if (this.instrument.type !== 'PIX') {
+      throw new ChargeStateError('Only Pix charges can reconcile expiration.');
+    }
+
+    if (this.currentStatus !== 'EXPIRED') {
+      throw new ChargeStateError(
+        `Cannot reconcile a Pix charge with status ${this.currentStatus}.`,
+      );
+    }
+
+    if (!(paidAt instanceof Date) || Number.isNaN(paidAt.getTime())) {
+      throw new ChargeStateError('Payment date is invalid.');
+    }
+
+    const evaluation = evaluatePixExpiration(this.dueDateValue, paidAt);
+
+    if (evaluation.isExpired) {
+      throw new ChargeStateError(
+        'Pix payment occurred after the tolerance period.',
+      );
+    }
+
+    this.currentStatus = 'PAID';
   }
 }

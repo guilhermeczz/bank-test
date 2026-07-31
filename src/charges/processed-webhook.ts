@@ -1,9 +1,17 @@
 import type { PspWebhookProcessingResult } from './psp-webhooks.service';
 
+export type PaidWebhookProcessingResult = Extract<
+  PspWebhookProcessingResult,
+  {
+    readonly event: 'boleto.paid' | 'pix.paid';
+    readonly status: 'PAID';
+  }
+>;
+
 export type ProcessedWebhookOutcome =
   | {
       readonly type: 'PAID';
-      readonly result: PspWebhookProcessingResult;
+      readonly result: PaidWebhookProcessingResult;
     }
   | {
       readonly type: 'AMOUNT_MISMATCH';

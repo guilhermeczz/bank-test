@@ -12,6 +12,7 @@ import {
 import { ChargeStateError } from '../domain/domain-error';
 import { PspWebhookDto } from './dto/psp-webhook.dto';
 import {
+  InvalidPixExpirationEventError,
   PaymentAmountMismatchError,
   PaymentReferenceNotFoundError,
   PspWebhooksService,
@@ -34,6 +35,10 @@ export class PspWebhooksController {
 
       if (error instanceof PaymentAmountMismatchError) {
         // O payload é válido, mas seu valor não pode ser processado.
+        throw new UnprocessableEntityException(error.message);
+      }
+
+      if (error instanceof InvalidPixExpirationEventError) {
         throw new UnprocessableEntityException(error.message);
       }
 

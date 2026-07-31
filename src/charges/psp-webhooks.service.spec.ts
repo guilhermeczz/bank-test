@@ -8,6 +8,7 @@ import { InMemoryChargeRepository } from './in-memory-charge.repository';
 import { InMemoryPaymentDivergenceRepository } from './in-memory-payment-divergence.repository';
 import { InMemoryProcessedWebhookRepository } from './in-memory-processed-webhook.repository';
 import {
+  InvalidPixExpirationEventError,
   PaymentAmountMismatchError,
   PaymentReferenceNotFoundError,
   PspWebhooksService,
@@ -70,6 +71,14 @@ function createPixInput(): PspWebhookDto {
     paidAmount: 45_050,
     paidAt: '2026-08-14T09:10:00-03:00',
     endToEndId: 'E12345678901234567890',
+  };
+}
+
+function createPixExpiredInput(): PspWebhookDto {
+  return {
+    event: 'pix.expired',
+    txid: 'pix-123456',
+    expiredAt: '2026-08-19T00:00:00-03:00',
   };
 }
 
@@ -557,6 +566,120 @@ describe('PspWebhooksService', () => {
 
     expect(() => service.process(input)).toThrow(ChargeStateError);
     expect(processedWebhookRepository.count()).toBe(0);
+  });
+
+  it('expires a pending Pix from a valid expiration event', () => {
+    const charge = createCharge('charge-pix', createPixInstrument());
+    repository.save(charge);
+    const saveSpy = jest.spyOn(repository, 'save');
+    saveSpy.mockClear();
+
+    const result = service.process(createPixExpiredInput());
+
+    expect(result).toEqual({
+      chargeId: charge.id,
+      status: 'EXPIRED',
+      event: 'pix.expired',
+    });
+    expect(charge.status).toBe('EXPIRED');
+    expect(saveSpy).toHaveBeenCalledWith(charge);
+    expect(processedWebhookRepository.count()).toBe(0);
+  });
+
+  it('rejects a premature Pix expiration and keeps it pending', () => {
+    const charge = createCharge('charge-pix', createPixInstrument());
+    repository.save(charge);
+    const input = createPixExpiredInput();
+    input.expiredAt = '2026-08-18T23:59:59-03:00';
+
+    expect(() => service.process(input)).toThrow(
+      InvalidPixExpirationEventError,
+    );
+    expect(charge.status).toBe('PENDING');
+  });
+
+  it('ignores a valid expiration received after Pix was paid', () => {
+    const charge = createCharge('charge-pix', createPixInstrument());
+    charge.markAsPaid();
+    repository.save(charge);
+
+    const result = service.process(createPixExpiredInput());
+
+    expect(result).toEqual({
+      chargeId: charge.id,
+      status: 'PAID',
+      event: 'pix.expired',
+    });
+    expect(charge.status).toBe('PAID');
+  });
+
+  it('replays Pix expiration safely through its expired state', () => {
+    const charge = createCharge('charge-pix', createPixInstrument());
+    repository.save(charge);
+
+    const first = service.process(createPixExpiredInput());
+    const repeated = service.process(createPixExpiredInput());
+
+    expect(first.status).toBe('EXPIRED');
+    expect(repeated.status).toBe('EXPIRED');
+    expect(charge.status).toBe('EXPIRED');
+  });
+
+  it('rejects Pix expiration for a cancelled charge', () => {
+    const charge = createCharge('charge-pix', createPixInstrument());
+    charge.cancel();
+    repository.save(charge);
+
+    expect(() => service.process(createPixExpiredInput())).toThrow(
+      ChargeStateError,
+    );
+    expect(charge.status).toBe('CANCELLED');
+  });
+
+  it('rejects Pix expiration with an unknown txid', () => {
+    expect(() => service.process(createPixExpiredInput())).toThrow(
+      PaymentReferenceNotFoundError,
+    );
+  });
+
+  it('reconciles a timely Pix payment received after expiration', () => {
+    const charge = createCharge('charge-pix', createPixInstrument());
+    charge.expire();
+    repository.save(charge);
+    const saveSpy = jest.spyOn(repository, 'save');
+    saveSpy.mockClear();
+    const input = createPixInput();
+    input.paidAt = '2026-08-18T23:59:59-03:00';
+
+    const result = service.process(input);
+
+    expect(result.status).toBe('PAID');
+    expect(charge.status).toBe('PAID');
+    expect(saveSpy).toHaveBeenCalledWith(charge);
+  });
+
+  it('keeps expired Pix rejected when paidAt is outside tolerance', () => {
+    const charge = createCharge('charge-pix', createPixInstrument());
+    charge.expire();
+    repository.save(charge);
+    const input = createPixInput();
+    input.paidAt = '2026-08-19T00:00:00-03:00';
+
+    expect(() => service.process(input)).toThrow(ChargeStateError);
+    expect(charge.status).toBe('EXPIRED');
+  });
+
+  it('records divergence during reconciliation and keeps Pix expired', () => {
+    const charge = createCharge('charge-pix', createPixInstrument());
+    charge.expire();
+    repository.save(charge);
+    const input = createPixInput();
+    input.paidAt = '2026-08-18T12:00:00-03:00';
+    input.paidAmount = 45_049;
+
+    expect(() => service.process(input)).toThrow(PaymentAmountMismatchError);
+    expect(charge.status).toBe('EXPIRED');
+    expect(divergenceRepository.findAll()).toHaveLength(1);
   });
 
   it('stores processedAt as a valid current ISO timestamp', () => {

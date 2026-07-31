@@ -5,7 +5,7 @@ import type { Charge } from '../domain/charge';
 import { calculateBoletoPaymentAmount } from '../domain/boleto-payment-amount';
 import { ChargeStateError } from '../domain/domain-error';
 import { evaluatePixExpiration } from '../domain/pix-expiration';
-import type { PspWebhookDto, PspWebhookEvent } from './dto/psp-webhook.dto';
+import type { PspWebhookDto } from './dto/psp-webhook.dto';
 import { InMemoryChargeRepository } from './in-memory-charge.repository';
 import { InMemoryPaymentDivergenceRepository } from './in-memory-payment-divergence.repository';
 import { InMemoryProcessedWebhookRepository } from './in-memory-processed-webhook.repository';
@@ -27,11 +27,26 @@ export class PaymentAmountMismatchError extends Error {
   }
 }
 
-export interface PspWebhookProcessingResult {
-  readonly chargeId: string;
-  readonly status: 'PAID';
-  readonly event: PspWebhookEvent;
+export class InvalidPixExpirationEventError extends Error {
+  constructor(expiredAt: string, lastPayableDate: string) {
+    super(
+      `Pix cannot expire at ${expiredAt}. It is payable through ${lastPayableDate}.`,
+    );
+    this.name = 'InvalidPixExpirationEventError';
+  }
 }
+
+export type PspWebhookProcessingResult =
+  | {
+      readonly chargeId: string;
+      readonly status: 'PAID';
+      readonly event: 'boleto.paid' | 'pix.paid';
+    }
+  | {
+      readonly chargeId: string;
+      readonly status: 'EXPIRED' | 'PAID';
+      readonly event: 'pix.expired';
+    };
 
 @Injectable()
 export class PspWebhooksService {
@@ -43,6 +58,11 @@ export class PspWebhooksService {
 
   process(input: PspWebhookDto): PspWebhookProcessingResult {
     this.validateRequiredFields(input);
+
+    if (input.event === 'pix.expired') {
+      return this.processPixExpiration(input);
+    }
+
     const webhookKey = this.createWebhookKey(input);
     const processed = this.processedWebhookRepository.findByKey(webhookKey);
 
@@ -55,26 +75,34 @@ export class PspWebhooksService {
     const charge =
       input.event === 'boleto.paid'
         ? this.findBoleto(input.nossoNumero)
-        : this.findPix(input.txid, input.endToEndId);
+        : this.findPix(input.txid);
+    const paidAt = this.getPaidAt(input);
+    const paidAmount = this.getPaidAmount(input);
+    let canReconcileExpiredPix = false;
 
     if (input.event === 'pix.paid') {
-      // O instante informado pelo PSP determina se o pagamento ocorreu dentro
-      // da tolerância, mesmo quando a entrega do webhook acontecer mais tarde.
+      // `paidAt` é o momento real do pagamento, ainda que o webhook tenha sido
+      // entregue posteriormente e a cobrança já esteja marcada como expirada.
       const evaluation = evaluatePixExpiration(
         charge.dueDate,
-        new Date(input.paidAt),
+        new Date(paidAt),
       );
 
-      if (charge.status === 'PENDING' && evaluation.isExpired) {
-        charge.expire();
-        this.repository.save(charge);
+      if (evaluation.isExpired) {
+        if (charge.status === 'PENDING') {
+          charge.expire();
+          this.repository.save(charge);
+        }
+
         throw new ChargeStateError('Pix expired before the payment occurred.');
       }
+
+      canReconcileExpiredPix = charge.status === 'EXPIRED';
     }
 
-    if (charge.status !== 'PENDING') {
-      // A própria entidade produz o erro de estado antes que uma diferença de
-      // valor seja interpretada incorretamente como divergência financeira.
+    if (charge.status !== 'PENDING' && !canReconcileExpiredPix) {
+      // A entidade produz o erro de estado antes que uma diferença de valor seja
+      // interpretada incorretamente como divergência financeira.
       charge.markAsPaid();
     }
 
@@ -83,46 +111,30 @@ export class PspWebhooksService {
         ? calculateBoletoPaymentAmount(
             charge.amountInCents,
             charge.dueDate,
-            input.paidAt,
+            paidAt,
           ).expectedAmount
         : charge.amountInCents;
 
-    if (input.paidAmount !== expectedAmount) {
-      // O registro precisa existir mesmo que o fluxo termine com HTTP 422, pois
-      // ele representa justamente a tentativa que não pôde quitar a cobrança.
-      this.divergenceRepository.save({
-        id: randomUUID(),
-        chargeId: charge.id,
-        event: input.event,
-        paymentReference: this.getPaymentReference(input),
-        ...(input.endToEndId === undefined
-          ? {}
-          : { endToEndId: input.endToEndId }),
-        paidAmount: input.paidAmount,
+    if (paidAmount !== expectedAmount) {
+      this.saveAmountMismatch(
+        input,
+        charge,
+        webhookKey,
+        paidAmount,
+        paidAt,
         expectedAmount,
-        paidAt: input.paidAt,
-        reason: 'AMOUNT_MISMATCH',
-        createdAt: new Date().toISOString(),
-      });
-      // Salvar a chave junto da primeira divergência impede que a mesma
-      // notificação repetida crie outro registro financeiro.
-      this.processedWebhookRepository.save({
-        key: webhookKey,
-        chargeId: charge.id,
-        event: input.event,
-        outcome: {
-          type: 'AMOUNT_MISMATCH',
-          paidAmount: input.paidAmount,
-          expectedAmount,
-        },
-        processedAt: new Date().toISOString(),
-      });
-      throw new PaymentAmountMismatchError(input.paidAmount, expectedAmount);
+      );
+      throw new PaymentAmountMismatchError(paidAmount, expectedAmount);
     }
 
-    // A entidade decide se o estado atual permite o pagamento; o service não
-    // repete regras para cobranças pagas, canceladas ou expiradas.
-    charge.markAsPaid();
+    if (canReconcileExpiredPix) {
+      // O estado EXPIRED ocorreu antes da confirmação; como o pagamento ocorreu
+      // dentro do prazo, esta transição reconcilia os eventos fora de ordem.
+      charge.reconcileExpiredPixPayment(new Date(paidAt));
+    } else {
+      charge.markAsPaid();
+    }
+
     this.repository.save(charge);
 
     const result: PspWebhookProcessingResult = {
@@ -141,45 +153,145 @@ export class PspWebhooksService {
     return result;
   }
 
+  private processPixExpiration(
+    input: PspWebhookDto,
+  ): PspWebhookProcessingResult {
+    const txid = input.txid;
+    const expiredAt = input.expiredAt;
+
+    if (txid === undefined || expiredAt === undefined) {
+      throw new Error('txid and expiredAt are required for pix.expired.');
+    }
+
+    const charge = this.repository.findByTxid(txid);
+
+    if (charge === null) {
+      throw new PaymentReferenceNotFoundError(txid);
+    }
+
+    // `expiredAt` representa o momento de expiração informado pelo PSP.
+    const evaluation = evaluatePixExpiration(
+      charge.dueDate,
+      new Date(expiredAt),
+    );
+
+    if (!evaluation.isExpired) {
+      throw new InvalidPixExpirationEventError(
+        expiredAt,
+        evaluation.lastPayableDate,
+      );
+    }
+
+    if (charge.status === 'PAID') {
+      // Uma expiração entregue depois do pagamento não pode sobrescrever PAID.
+      return { chargeId: charge.id, status: 'PAID', event: 'pix.expired' };
+    }
+
+    if (charge.status === 'EXPIRED') {
+      return { chargeId: charge.id, status: 'EXPIRED', event: 'pix.expired' };
+    }
+
+    if (charge.status === 'CANCELLED') {
+      throw new ChargeStateError('Cancelled Pix cannot expire.');
+    }
+
+    charge.expire();
+    this.repository.save(charge);
+
+    return { chargeId: charge.id, status: 'EXPIRED', event: 'pix.expired' };
+  }
+
+  private saveAmountMismatch(
+    input: PspWebhookDto,
+    charge: Charge,
+    webhookKey: string,
+    paidAmount: number,
+    paidAt: string,
+    expectedAmount: number,
+  ): void {
+    this.divergenceRepository.save({
+      id: randomUUID(),
+      chargeId: charge.id,
+      event: input.event === 'boleto.paid' ? 'boleto.paid' : 'pix.paid',
+      paymentReference: this.getPaymentReference(input),
+      ...(input.endToEndId === undefined
+        ? {}
+        : { endToEndId: input.endToEndId }),
+      paidAmount,
+      expectedAmount,
+      paidAt,
+      reason: 'AMOUNT_MISMATCH',
+      createdAt: new Date().toISOString(),
+    });
+    this.processedWebhookRepository.save({
+      key: webhookKey,
+      chargeId: charge.id,
+      event: input.event === 'boleto.paid' ? 'boleto.paid' : 'pix.paid',
+      outcome: { type: 'AMOUNT_MISMATCH', paidAmount, expectedAmount },
+      processedAt: new Date().toISOString(),
+    });
+  }
+
   private validateRequiredFields(input: PspWebhookDto): void {
     if (input.event === 'boleto.paid') {
       if (input.nossoNumero === undefined || input.nossoNumero.length === 0) {
         throw new Error('nossoNumero is required for boleto.paid.');
       }
 
+      this.validatePaymentFields(input);
       return;
     }
 
     if (input.txid === undefined || input.txid.length === 0) {
-      throw new Error('txid is required for pix.paid.');
+      throw new Error(`txid is required for ${input.event}.`);
+    }
+
+    if (input.event === 'pix.expired') {
+      if (input.expiredAt === undefined || input.expiredAt.length === 0) {
+        throw new Error('expiredAt is required for pix.expired.');
+      }
+
+      if (Number.isNaN(new Date(input.expiredAt).getTime())) {
+        throw new Error('expiredAt must be a valid date and time.');
+      }
+
+      return;
     }
 
     if (input.endToEndId === undefined || input.endToEndId.length === 0) {
       throw new Error('endToEndId is required for pix.paid.');
     }
+
+    this.validatePaymentFields(input);
+  }
+
+  private validatePaymentFields(input: PspWebhookDto): void {
+    if (
+      input.paidAmount === undefined ||
+      !Number.isInteger(input.paidAmount) ||
+      input.paidAmount < 1
+    ) {
+      throw new Error('paidAmount must be a positive integer.');
+    }
+
+    if (
+      input.paidAt === undefined ||
+      Number.isNaN(new Date(input.paidAt).getTime())
+    ) {
+      throw new Error('paidAt must be a valid date and time.');
+    }
   }
 
   private createWebhookKey(input: PspWebhookDto): string {
-    const paidAt = new Date(input.paidAt);
-
-    if (Number.isNaN(paidAt.getTime())) {
-      throw new Error('paidAt must be a valid date and time.');
-    }
-
-    // Componentes em ordem fixa tornam a chave determinística. Normalizar
-    // `paidAt` faz offsets diferentes do mesmo instante produzirem a mesma chave.
+    const paidAt = new Date(this.getPaidAt(input));
+    const paidAmount = this.getPaidAmount(input);
     const components =
       input.event === 'boleto.paid'
-        ? [
-            input.event,
-            input.nossoNumero,
-            input.paidAmount,
-            paidAt.toISOString(),
-          ]
+        ? [input.event, input.nossoNumero, paidAmount, paidAt.toISOString()]
         : [
             input.event,
             input.txid,
-            input.paidAmount,
+            paidAmount,
             paidAt.toISOString(),
             input.endToEndId,
           ];
@@ -205,7 +317,6 @@ export class PspWebhooksService {
       throw new Error('nossoNumero is required for boleto.paid.');
     }
 
-    // A referência externa do boleto é o nossoNumero emitido pelo PSP.
     const charge = this.repository.findByNossoNumero(nossoNumero);
 
     if (charge === null) {
@@ -215,19 +326,11 @@ export class PspWebhooksService {
     return charge;
   }
 
-  private findPix(
-    txid: string | undefined,
-    endToEndId: string | undefined,
-  ): Charge {
+  private findPix(txid: string | undefined): Charge {
     if (txid === undefined || txid.length === 0) {
-      throw new Error('txid is required for pix.paid.');
+      throw new Error('txid is required for Pix events.');
     }
 
-    if (endToEndId === undefined || endToEndId.length === 0) {
-      throw new Error('endToEndId is required for pix.paid.');
-    }
-
-    // A referência externa usada para localizar o Pix é o txid emitido pelo PSP.
     const charge = this.repository.findByTxid(txid);
 
     if (charge === null) {
@@ -246,5 +349,21 @@ export class PspWebhooksService {
     }
 
     return reference;
+  }
+
+  private getPaidAt(input: PspWebhookDto): string {
+    if (input.paidAt === undefined) {
+      throw new Error('paidAt is required for payment events.');
+    }
+
+    return input.paidAt;
+  }
+
+  private getPaidAmount(input: PspWebhookDto): number {
+    if (input.paidAmount === undefined) {
+      throw new Error('paidAmount is required for payment events.');
+    }
+
+    return input.paidAmount;
   }
 }

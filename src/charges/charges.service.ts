@@ -1,5 +1,5 @@
 import { Injectable } from '@nestjs/common';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 
 import { Charge } from '../domain/charge';
 import { validateChargeAmount } from '../domain/charge-amount';
@@ -16,6 +16,7 @@ import {
   InMemoryChargeRepository,
   type PaginatedCharges,
 } from './in-memory-charge.repository';
+import { InMemoryIdempotentChargeRequestRepository } from './in-memory-idempotent-charge-request.repository';
 
 /** Representa uma falha técnica ao conversar com o provedor de pagamentos. */
 export class PaymentProviderError extends Error {
@@ -33,6 +34,20 @@ export class ChargeNotFoundError extends Error {
   }
 }
 
+export class InvalidIdempotencyKeyError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'InvalidIdempotencyKeyError';
+  }
+}
+
+export class IdempotencyConflictError extends Error {
+  constructor(key: string) {
+    super(`Idempotency key ${key} was already used with a different request.`);
+    this.name = 'IdempotencyConflictError';
+  }
+}
+
 /**
  * Coordena a criação da cobrança: valida os dados, solicita o instrumento ao PSP,
  * cria a entidade e persiste o resultado. As regras continuam implementadas no
@@ -43,9 +58,13 @@ export class ChargesService {
   constructor(
     private readonly repository: InMemoryChargeRepository,
     private readonly paymentProvider: FakePaymentProvider,
+    private readonly idempotencyRepository: InMemoryIdempotentChargeRequestRepository,
   ) {}
 
-  async create(input: CreateChargeDto): Promise<Charge> {
+  async create(
+    input: CreateChargeDto,
+    idempotencyKey?: string,
+  ): Promise<Charge> {
     const payerDocument = new PayerDocument(input.payer.document);
     const payer: Payer = {
       name: input.payer.name,
@@ -60,6 +79,32 @@ export class ChargesService {
 
     if (description.length === 0) {
       throw new ChargeValidationError('Charge description cannot be empty.');
+    }
+
+    const normalizedKey = this.normalizeIdempotencyKey(idempotencyKey);
+    const requestHash =
+      normalizedKey === undefined
+        ? undefined
+        : this.createRequestHash(input, payerDocument.value, description);
+
+    if (normalizedKey !== undefined && requestHash !== undefined) {
+      const existing = this.idempotencyRepository.findByKey(normalizedKey);
+
+      if (existing !== null) {
+        if (existing.requestHash !== requestHash) {
+          throw new IdempotencyConflictError(normalizedKey);
+        }
+
+        // A repetição retorna a entidade já persistida antes de chegar ao PSP,
+        // evitando outro instrumento, UUID ou registro de cobrança.
+        const existingCharge = this.repository.findById(existing.chargeId);
+
+        if (existingCharge === null) {
+          throw new Error('Idempotency record points to a missing charge.');
+        }
+
+        return existingCharge;
+      }
     }
 
     let paymentInstrument: PaymentInstrument;
@@ -82,6 +127,17 @@ export class ChargesService {
     });
 
     this.repository.save(charge);
+
+    if (normalizedKey !== undefined && requestHash !== undefined) {
+      // A chave só é salva depois da cobrança para que falhas de validação ou do
+      // PSP não bloqueiem permanentemente uma tentativa futura válida.
+      this.idempotencyRepository.save({
+        key: normalizedKey,
+        requestHash,
+        chargeId: charge.id,
+        createdAt: new Date().toISOString(),
+      });
+    }
 
     return charge;
   }
@@ -145,5 +201,45 @@ export class ChargesService {
     // scheduler e persiste a expiração quando a cobrança volta a ser acessada.
     charge.expire();
     this.repository.save(charge);
+  }
+
+  private normalizeIdempotencyKey(key: string | undefined): string | undefined {
+    if (key === undefined) {
+      return undefined;
+    }
+
+    const normalizedKey = key.trim();
+
+    if (normalizedKey.length === 0) {
+      throw new InvalidIdempotencyKeyError('Idempotency key cannot be empty.');
+    }
+
+    if (normalizedKey.length > 255) {
+      throw new InvalidIdempotencyKeyError(
+        'Idempotency key cannot exceed 255 characters.',
+      );
+    }
+
+    return normalizedKey;
+  }
+
+  private createRequestHash(
+    input: CreateChargeDto,
+    normalizedDocument: string,
+    description: string,
+  ): string {
+    // O array fixa a ordem dos campos, independentemente da ordem recebida no
+    // JSON. O documento normalizado trata versões formatadas como o mesmo valor.
+    const canonicalRequest = JSON.stringify([
+      input.payer.name,
+      normalizedDocument,
+      input.payer.email,
+      input.amount,
+      input.dueDate,
+      description,
+      input.paymentMethod,
+    ]);
+
+    return createHash('sha256').update(canonicalRequest).digest('hex');
   }
 }

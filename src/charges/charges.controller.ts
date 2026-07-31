@@ -5,6 +5,7 @@ import {
   ConflictException,
   Controller,
   Get,
+  Headers,
   HttpCode,
   HttpStatus,
   NotFoundException,
@@ -24,6 +25,8 @@ import { ListChargesQueryDto } from './dto/list-charges-query.dto';
 import {
   ChargeNotFoundError,
   ChargesService,
+  IdempotencyConflictError,
+  InvalidIdempotencyKeyError,
   PaymentProviderError,
 } from './charges.service';
 
@@ -32,9 +35,12 @@ export class ChargesController {
   constructor(private readonly chargesService: ChargesService) {}
 
   @Post()
-  async create(@Body() input: CreateChargeDto) {
+  async create(
+    @Body() input: CreateChargeDto,
+    @Headers('idempotency-key') idempotencyKey?: string,
+  ) {
     try {
-      const charge = await this.chargesService.create(input);
+      const charge = await this.chargesService.create(input, idempotencyKey);
 
       return this.toResponse(charge);
     } catch (error: unknown) {
@@ -98,7 +104,8 @@ export class ChargesController {
   private handleKnownError(error: unknown): never {
     if (
       error instanceof ChargeValidationError ||
-      error instanceof PayerDocumentValidationError
+      error instanceof PayerDocumentValidationError ||
+      error instanceof InvalidIdempotencyKeyError
     ) {
       throw new BadRequestException(error.message);
     }
@@ -114,6 +121,10 @@ export class ChargesController {
 
     if (error instanceof ChargeStateError) {
       // A operação é válida, mas conflita com o estado atual da cobrança.
+      throw new ConflictException(error.message);
+    }
+
+    if (error instanceof IdempotencyConflictError) {
       throw new ConflictException(error.message);
     }
 

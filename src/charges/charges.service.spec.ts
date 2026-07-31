@@ -7,9 +7,12 @@ import type { CreateChargeDto } from './dto/create-charge.dto';
 import type { ListChargesQueryDto } from './dto/list-charges-query.dto';
 import { FakePaymentProvider } from './fake-payment-provider';
 import { InMemoryChargeRepository } from './in-memory-charge.repository';
+import { InMemoryIdempotentChargeRequestRepository } from './in-memory-idempotent-charge-request.repository';
 import {
   ChargeNotFoundError,
   ChargesService,
+  IdempotencyConflictError,
+  InvalidIdempotencyKeyError,
   PaymentProviderError,
 } from './charges.service';
 
@@ -30,6 +33,7 @@ function createInput(paymentMethod: PaymentMethod = 'BOLETO'): CreateChargeDto {
 describe('ChargesService', () => {
   let repository: InMemoryChargeRepository;
   let paymentProvider: FakePaymentProvider;
+  let idempotencyRepository: InMemoryIdempotentChargeRequestRepository;
   let service: ChargesService;
 
   beforeEach(() => {
@@ -37,15 +41,20 @@ describe('ChargesService', () => {
     jest.setSystemTime(new Date('2026-08-10T12:00:00-03:00'));
     repository = new InMemoryChargeRepository();
     paymentProvider = new FakePaymentProvider(0);
-    service = new ChargesService(repository, paymentProvider);
+    idempotencyRepository = new InMemoryIdempotentChargeRequestRepository();
+    service = new ChargesService(
+      repository,
+      paymentProvider,
+      idempotencyRepository,
+    );
   });
 
   afterEach(() => {
     jest.useRealTimers();
   });
 
-  async function createCharge(input: CreateChargeDto) {
-    const creation = service.create(input);
+  async function createCharge(input: CreateChargeDto, idempotencyKey?: string) {
+    const creation = service.create(input, idempotencyKey);
     await jest.runAllTimersAsync();
     return creation;
   }
@@ -345,5 +354,145 @@ describe('ChargesService', () => {
 
     expect(result.items).toHaveLength(1);
     expect(result).toMatchObject({ page: 2, limit: 1, total: 2 });
+  });
+
+  describe('creation idempotency', () => {
+    it('creates a charge and stores its idempotency record', async () => {
+      const charge = await createCharge(createInput(), 'charge-key');
+
+      expect(repository.findById(charge.id)).toBe(charge);
+      expect(idempotencyRepository.findByKey('charge-key')).toMatchObject({
+        key: 'charge-key',
+        chargeId: charge.id,
+      });
+    });
+
+    it('returns the same charge and instrument for an exact repetition', async () => {
+      const first = await createCharge(createInput(), 'charge-key');
+      const repeated = await createCharge(createInput(), 'charge-key');
+
+      expect(repeated.id).toBe(first.id);
+      expect(repeated.paymentInstrument).toBe(first.paymentInstrument);
+    });
+
+    it('does not call the provider or add records for a repetition', async () => {
+      const issueSpy = jest.spyOn(paymentProvider, 'issue');
+      await createCharge(createInput(), 'charge-key');
+
+      await createCharge(createInput(), 'charge-key');
+
+      expect(issueSpy).toHaveBeenCalledTimes(1);
+      expect(repository.count()).toBe(1);
+      expect(idempotencyRepository.count()).toBe(1);
+    });
+
+    it('ignores object property order when generating the request hash', async () => {
+      const input = createInput();
+      const reordered: CreateChargeDto = {
+        paymentMethod: input.paymentMethod,
+        description: input.description,
+        dueDate: input.dueDate,
+        amount: input.amount,
+        payer: input.payer,
+      };
+      const first = await createCharge(input, 'charge-key');
+
+      const repeated = await createCharge(reordered, 'charge-key');
+
+      expect(repeated.id).toBe(first.id);
+    });
+
+    it('treats formatted and unformatted documents as the same request', async () => {
+      const first = await createCharge(createInput(), 'charge-key');
+      const unformatted = createInput();
+      unformatted.payer.document = '52998224725';
+
+      const repeated = await createCharge(unformatted, 'charge-key');
+
+      expect(repeated.id).toBe(first.id);
+    });
+
+    it.each([
+      ['amount', (input: CreateChargeDto) => (input.amount = 45_051)],
+      [
+        'payment method',
+        (input: CreateChargeDto) => (input.paymentMethod = 'PIX'),
+      ],
+      ['payer', (input: CreateChargeDto) => (input.payer.name = 'João Souza')],
+    ])('rejects the same key with different %s', async (_name, changeInput) => {
+      await createCharge(createInput(), 'charge-key');
+      const differentInput = createInput();
+      changeInput(differentInput);
+
+      await expect(
+        service.create(differentInput, 'charge-key'),
+      ).rejects.toThrow(IdempotencyConflictError);
+      expect(repository.count()).toBe(1);
+    });
+
+    it('creates different charges for different keys and equal content', async () => {
+      const first = await createCharge(createInput(), 'charge-key-1');
+      const second = await createCharge(createInput(), 'charge-key-2');
+
+      expect(second.id).not.toBe(first.id);
+      expect(repository.count()).toBe(2);
+    });
+
+    it('keeps creating charges when the key is absent', async () => {
+      const first = await createCharge(createInput());
+      const second = await createCharge(createInput());
+
+      expect(second.id).not.toBe(first.id);
+      expect(idempotencyRepository.count()).toBe(0);
+    });
+
+    it('trims surrounding spaces from the key', async () => {
+      await createCharge(createInput(), '  charge-key  ');
+
+      expect(idempotencyRepository.findByKey('charge-key')).not.toBeNull();
+      expect(idempotencyRepository.findByKey('  charge-key  ')).toBeNull();
+    });
+
+    it('rejects an empty key', async () => {
+      await expect(service.create(createInput(), '   ')).rejects.toThrow(
+        InvalidIdempotencyKeyError,
+      );
+      expect(idempotencyRepository.count()).toBe(0);
+    });
+
+    it('rejects a key longer than 255 characters', async () => {
+      await expect(
+        service.create(createInput(), 'a'.repeat(256)),
+      ).rejects.toThrow(InvalidIdempotencyKeyError);
+      expect(idempotencyRepository.count()).toBe(0);
+    });
+
+    it('does not store the key when the provider fails', async () => {
+      paymentProvider.failNextRequest();
+      const expectation = expect(
+        service.create(createInput(), 'charge-key'),
+      ).rejects.toThrow(PaymentProviderError);
+
+      await jest.runAllTimersAsync();
+      await expectation;
+      expect(idempotencyRepository.count()).toBe(0);
+    });
+
+    it('does not store the key when charge validation fails', async () => {
+      const input = createInput();
+      input.amount = 999;
+
+      await expect(service.create(input, 'charge-key')).rejects.toThrow();
+      expect(idempotencyRepository.count()).toBe(0);
+    });
+
+    it('stores createdAt as a valid current ISO timestamp', async () => {
+      await createCharge(createInput(), 'charge-key');
+
+      const createdAt =
+        idempotencyRepository.findByKey('charge-key')?.createdAt;
+      expect(createdAt).toBe('2026-08-10T15:00:00.000Z');
+      expect(new Date(createdAt ?? '').toISOString()).toBe(createdAt);
+    });
   });
 });
