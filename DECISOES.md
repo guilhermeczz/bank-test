@@ -601,4 +601,3 @@ Continuo responsável:
 - pelas decisões;
 - pelas limitações documentadas;
 - pelos testes;
-- por conseguir explicar a solução durante a avaliação.
