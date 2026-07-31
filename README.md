@@ -33,7 +33,10 @@ Principais regras implementadas:
 ## Requisitos
 
 É necessário utilizar uma versão LTS do Node.js compatível com as dependências
-do projeto. O repositório não fixa uma versão exata do Node.js.
+do projeto.
+
+ Node.js 24.14.1
+ npm 11.11.0
 
 ## Instalação
 
